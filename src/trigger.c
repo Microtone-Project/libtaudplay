@@ -843,6 +843,19 @@ static TaudVoice *ghost_rig(TaudEngine *e, TaudVoice *voice, int channel)
     return bg;
 }
 
+/* Apply New Note Action `nna` to a freshly spawned ghost. */
+static void release_ghost(TaudEngine *e, TaudVoice *bg, int nna)
+{
+    if (nna == 1) {
+        te_start_cut_ramp(e, bg);
+    } else if (nna == 0 || nna == 4) {
+        bg->keyOff = true;
+        te_apply_key_lift(bg, &e->instruments[bg->instrumentId]);
+    } else if (nna == 3) {
+        bg->noteFading = true;
+    }
+}
+
 void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *voice, int channel, int incomingInst)
 {
     int nna;
@@ -862,22 +875,53 @@ void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *voice, int chan
         voice->psgCarry = true;
         return;
     }
-    if (nna == 1) {
-        bg = ghost_rig(e, voice, channel);
-        if (bg != NULL) te_start_cut_ramp(e, bg);
-        te_cap_background_voices(e);
-        return;
-    }
     bg = ghost_rig(e, voice, channel);
-    if (bg != NULL) {
-        if (nna == 0 || nna == 4) {
-            bg->keyOff = true;
-            te_apply_key_lift(bg, &e->instruments[bg->instrumentId]);
-        } else if (nna == 3) {
-            bg->noteFading = true;
+    if (bg != NULL) release_ghost(e, bg, nna);
+    te_cap_background_voices(e);
+}
+
+/* One voice of lane vi's note, for Q's retrigger: false = restart in place. */
+static bool hand_off_one(TaudEngine *e, TaudVoice *v, int vi, int override)
+{
+    const TaudInst *inst = &e->instruments[v->instrumentId];
+    TaudVoice *bg;
+    int nna;
+    if (!inst_retrig_follows_nna(inst)) return false;
+    nna = override >= 0 ? override : inst_new_note_action(inst);
+    /* An OPL or PSG note cut by a note of its own instrument is the chip
+     * keying the same channel on again: no ghost — the plain restart. */
+    if (nna == 1 && (v->opl != NULL || v->psg != NULL) && v->fmRig == NULL) return false;
+    bg = ghost_rig(e, v, vi);
+    if (bg != NULL) release_ghost(e, bg, nna);
+    v->retrigFresh = true;
+    v->attackRampSamples = inst_is_chip(inst) ? 0 : e->attackRampSamples;
+    return true;
+}
+
+/* Q's retrigger on lane vi, before the restart (spec §5.7, §6 step 13): every
+ * sounding voice of the note whose OWN instrument sets byte 186 bit 6 hands
+ * its sound to the background pool per the New Note Action (the lane's
+ * S $73…$76 override first), then restarts as a fresh trigger does. Layer
+ * children first, the foreground last; FM operands go with their carrier.
+ * The pool is capped once, at the end, so the scan never sees it shrink. */
+void te_retrig_hand_off(TaudEngine *e, TaudVoice *voice, int vi)
+{
+    int override = voice->nnaOverride;
+    int n = e->bgCount, i;
+    for (i = 0; i < n; i++) {
+        TaudVoice *bg = e->bg[i];
+        if (bg->fmOperator || !bg->active || !te_is_sounding_child(e, bg, vi)) continue;
+        hand_off_one(e, bg, vi, override);
+    }
+    if (voice->active && hand_off_one(e, voice, vi, override) && voice->fmRig != NULL) {
+        for (i = 0; i < n; i++) {
+            TaudVoice *op = e->bg[i];
+            if (!op->fmOperator || !te_is_sounding_child(e, op, vi)) continue;
+            op->retrigFresh = true;
+            op->attackRampSamples = inst_is_chip(&e->instruments[op->instrumentId]) ? 0 : e->attackRampSamples;
         }
     }
-    te_cap_background_voices(e);
+    if (e->bgCount > n) te_cap_background_voices(e);
 }
 
 void te_apply_past_note_action(TaudEngine *e, int channel, int action)

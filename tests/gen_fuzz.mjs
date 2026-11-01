@@ -145,6 +145,9 @@ function typedFields(b, s) {
   b[183] = ri(0, 255);
   w16(b, 184, chance(0.3) ? ri(0, 0xffff) : 0);
   b[186] = pick([0, 1, 1, 2, 3]) | (chance(0.2) ? 0x20 : 0) | (ri(0, 7) << 2);
+  // FUZZ_RETRIG=1: Q's retrigger follows the NNA (byte 186 bit 6) on half the
+  // instruments. Opt-in, so every existing seed keeps its stream.
+  if (process.env.FUZZ_RETRIG && chance(0.5)) b[186] |= 0x40;
   b[187] = chance(0.3) ? ri(0, 255) : 0;
   b[188] = chance(0.3) ? ri(0, 255) : 0;
   b[195] = chance(0.5) ? ri(0, 255) : pick([0x04, 0x14, 0x24, 0x10, 0x02, 0x06]);

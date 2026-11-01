@@ -121,10 +121,14 @@ static void restart_voice(TaudEngine *e, TaudVoice *v)
     v->right.nesDpcmCounter = 63;
     /* An OPL channel restarts the way the chip re-keys one: the attack from
      * wherever each envelope stands, the phase from zero (§5.5.2). */
-    if (v->opl != NULL && v->opl->patch != NULL) te_opl_key_on(v->opl, v->opl->patch, true);
+    /* Unless te_retrig_hand_off gave its sound to a ghost, which took those
+     * envelopes along: then it keys on from silence, as for a fresh note. */
+    bool carry = !v->retrigFresh;
+    v->retrigFresh = false;
+    if (v->opl != NULL && v->opl->patch != NULL) te_opl_key_on(v->opl, v->opl->patch, carry);
     /* …and a PSG pair the same way; an oscillator with its X flag set
      * restarts its internal status here too, as at any key-on (§5.5.4). */
-    if (v->psg != NULL && v->psg->patch != NULL) te_psg_key_on(v->psg, v->psg->patch, true);
+    if (v->psg != NULL && v->psg->patch != NULL) te_psg_key_on(v->psg, v->psg->patch, carry);
     /* A voice sounding a formant instrument says its syllable again (item 212). */
     if (v->formant != NULL) te_formant_restart(e, v->formant);
 }
@@ -577,6 +581,8 @@ void te_apply_tracker_tick(TaudEngine *e)
             voice->retrigCounter++;
             if (voice->retrigCounter >= voice->retrigInterval) {
                 voice->retrigCounter = 0;
+                /* Byte 186 bit 6: ghost the outgoing sound per its NNA first. */
+                te_retrig_hand_off(e, voice, vi);
                 restart_voice(e, voice);
                 for (i = 0; i < e->bgCount; i++) {
                     if (te_is_sounding_child(e, e->bg[i], vi)) restart_voice(e, e->bg[i]);

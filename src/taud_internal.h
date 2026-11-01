@@ -514,6 +514,9 @@ static inline int inst_new_note_action(const TaudInst *i)
     return n <= 4 ? n : 0;
 }
 static inline bool inst_nna_key_lift(const TaudInst *i) { return inst_new_note_action(i) == 4; }
+/* Byte 186 bit 6: Q's retrigger hands the outgoing sound to the background
+ * pool per the New Note Action instead of cutting it (spec §5.7). */
+static inline bool inst_retrig_follows_nna(const TaudInst *i) { return (i->instrumentFlag & 0x40) != 0; }
 static inline int inst_vibrato_waveform(const TaudInst *i) { return (i->instrumentFlag >> 2) & 0x07; }
 static inline int inst_sample_detune_signed(const TaudInst *i)
 {
@@ -776,6 +779,9 @@ struct TaudVoice {
 
     int retrigCounter, retrigInterval, retrigVolMod;
     bool retrigActive;
+    /* Set by te_retrig_hand_off on a voice Q just ghosted; read and cleared
+     * by the restart, whose chip then keys on from silence. */
+    bool retrigFresh;
 
     int noteDelayTick, delayedNote, delayedInst, delayedVol;
     int delayedInterruptArg;
@@ -1523,6 +1529,7 @@ void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int v
 int te_narrow_vol_axis(const TaudEngine *e, int v);
 void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note);
 void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel, int incomingInst);
+void te_retrig_hand_off(TaudEngine *e, TaudVoice *voice, int vi);
 void te_apply_past_note_action(TaudEngine *e, int channel, int action);
 void te_apply_vol_column(TaudEngine *e, TaudVoice *v, int value, int sel);
 void te_apply_pan_column(TaudEngine *e, TaudVoice *v, int value, int sel);
