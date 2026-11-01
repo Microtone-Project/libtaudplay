@@ -506,12 +506,16 @@ void te_inst_toggle_invert_bit(TaudInst *inst, int loopOffset, int loopLen)
     if ((idx >> 3) < inst->invertMaskLen) inst->invertMask[idx >> 3] ^= (uint8_t)(1 << (idx & 7));
 }
 
+/* A read never changes the mask: one sized for another loop (a voice on a
+ * different Ixmp patch of this instrument) simply does not apply to it. The
+ * JS mixer visits voices span by span and this one sample by sample, so a
+ * read that discarded the mask made the two disagree (item 262). */
 bool te_inst_invert_bit(TaudInst *inst, int loopOffset, int loopLen)
 {
     int len, idx;
     if (inst->invertMaskLen == 0) return false;
     len = imax(loopLen, 1);
-    if (inst->invertMaskLen != ((len + 7) >> 3)) { inst->invertMaskLen = 0; return false; }
+    if (inst->invertMaskLen != ((len + 7) >> 3)) return false;
     idx = iclamp(loopOffset, 0, len - 1);
     return ((inst->invertMask[idx >> 3] >> (idx & 7)) & 1) != 0;
 }
