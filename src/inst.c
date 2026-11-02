@@ -439,7 +439,10 @@ void te_inst_load_record(TaudInst *inst, const uint8_t *b)
             instIdx = b[o] | (((b[o + 8] >> 6) & 0x3) << 8);
             mixOctet = b[o + 1];
             detRaw = b[o + 2] | (b[o + 3] << 8);
-            fixedPitch = !fm && (b[o + 9] & META_LAYER_FIXED_PITCH) != 0;
+            /* Fixed pitch: a layer's (item 179) or a rack operator's fixed
+             * frequency (item 278) — the detune field is then an unsigned
+             * note word, so read the flag before the sign conversion. */
+            fixedPitch = (b[o + 9] & META_LAYER_FIXED_PITCH) != 0;
             detune = fixedPitch ? detRaw : (detRaw >= 0x8000 ? detRaw - 0x10000 : detRaw);
             pStart = b[o + 4] | (b[o + 5] << 8);
             pEnd = b[o + 6] | (b[o + 7] << 8);

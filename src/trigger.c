@@ -357,10 +357,12 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
     chanPan = voice->channelPan; chanRowPan = voice->rowPan;
     chanPanbrello = voice->panbrelloOffset;
     chanAzimuth = voice->panAzimuth; chanElevation = voice->panElevation;
-    te_trigger_note(e, voice, iclamp(noteVal + ops[0].detune, 0x20, 0xffff), ops[0].instIdx, rowVolOverride);
+    /* What each operator SOUNDS: the trigger at its ratio, or a FIXED-
+     * frequency operator's own note (item 278, the DX7's FIXED mode). */
+    te_trigger_note(e, voice, pitch_of(&ops[0], noteVal), ops[0].instIdx, rowVolOverride);
     voice->layerMixGain = 1.0;
     voice->layerRelDetune = 0;
-    voice->layerFixedNote = -1;
+    voice->layerFixedNote = ops[0].fixedPitch ? pitch_of(&ops[0], noteVal) : -1;
     voice->layerRelPan = 0;
     voice->layerRelElevation = 0;
     voice->isLayerChild = false;
@@ -383,13 +385,14 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
         op = te_voice_alloc(e);
         if (op == NULL) break;
         seed_child_lane_context(op, voice, chanPan, chanRowPan, chanPanbrello, chanAzimuth, chanElevation);
-        te_trigger_note(e, op, iclamp(noteVal + ops[k].detune, 0x20, 0xffff), ops[k].instIdx, rowVolOverride);
+        te_trigger_note(e, op, pitch_of(&ops[k], noteVal), ops[k].instIdx, rowVolOverride);
         op->isLayerChild = true;
         op->fmOperator = true;
         op->fmParent = voice;
         op->sourceChannel = vi;
         op->displayInst = voice->displayInst;
-        op->layerRelDetune = ops[k].detune - ops[0].detune;
+        op->layerRelDetune = te_layer_note(&ops[k], noteVal) - te_layer_note(&ops[0], noteVal);
+        op->layerFixedNote = ops[k].fixedPitch ? pitch_of(&ops[k], noteVal) : -1;
         op->layerMixGain = 1.0;
         op->layerRelPan = 0;
         op->layerRelElevation = 0;
@@ -588,7 +591,7 @@ static void principal_of(TaudEngine *e, int instId, int note, int *outInst, int 
     op0 = &inst->meta->layers[0];
     if (op0->instIdx < 1 || op0->instIdx > 1023) return;
     *outInst = op0->instIdx;
-    *outNote = iclamp(note + op0->detune, 0x20, 0xffff);
+    *outNote = iclamp(te_layer_note(op0, note), 0x20, 0xffff);
 }
 
 typedef struct { int newInstId, newNote; uint32_t newSmpPtr; int newSmpLen; } DupKey;
@@ -835,6 +838,7 @@ static TaudVoice *ghost_rig(TaudEngine *e, TaudVoice *voice, int channel)
         op->fmOperator = true;
         op->fmParent = bg;
         op->layerRelDetune = src->layerRelDetune;
+        op->layerFixedNote = src->layerFixedNote; /* a FIXED operand stays fixed (item 278) */
         op->layerPitchMod = 0;
         op->layerMixGain = src->layerMixGain;
         copy->voices[k] = op;

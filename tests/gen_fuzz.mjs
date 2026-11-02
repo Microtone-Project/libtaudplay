@@ -297,6 +297,11 @@ for (let idx = 40; idx < 43; idx++) {
     ops.push({ inst: chance(0.7) ? pick(sampleInsts.slice(0, 6)) : pick([...oplInsts, ...psgInsts, ...formantInsts]), mix: ri(120, 200), detune: ri(-300, 3000),
       ps: 0, pe: 0xffff, vs: 0, ve: 63, fixed: false });
   }
+  // FUZZ_FIXED=1: fixed-frequency operators (item 278, the DX7's FIXED mode),
+  // operator 0 included. Opt-in, so the seeds without it keep their streams.
+  if (process.env.FUZZ_FIXED) {
+    for (const o of ops) if (chance(0.35)) { o.fixed = true; o.detune = ri(0x2000, 0x8000); }
+  }
   const progs = [
     [nOps - 1, 0x0400 | 0],
     [0x0800 | 0, 0x0400 | 0],
