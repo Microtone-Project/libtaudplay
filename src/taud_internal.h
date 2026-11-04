@@ -355,8 +355,9 @@ typedef struct {
     int len, offset, rate, tilt, gain;
 } TaudFormantSlot;
 
-/* The decoded tract block (FormantPatch). */
-typedef struct {
+/* The decoded tract block (FormantPatch) — or a LYRIC SYLLABLE built from
+ * one (te_formant_lyric_syllable). */
+typedef struct TaudFormantPatch {
     uint32_t srcPtr;
     int srcInst;                /* the header's source instrument, 0 = the sample */
     int front, open, round, track, glide, timing;
@@ -368,7 +369,45 @@ typedef struct {
     int codaArt;                /* the coda: CODA_* */
     uint32_t rangeLo, rangeHi;
     TaudFormantSlot slots[FORMANT_SLOTS];
+    /* A lyric syllable times each of its consonants and its glide by a byte
+     * of its own — [onset 1, onset 2, coda, glide], read as `timing` is and
+     * applied ON TOP of it. hasSlotTiming false on a record, whose one byte
+     * times them all. */
+    bool hasSlotTiming;
+    uint8_t slotTiming[4];
+    /* …and the record it is a syllable of; NULL on a record. */
+    const struct TaudFormantPatch *lyricOf;
 } TaudFormantPatch;
+
+/* ── lyric instruments: the `ILyr` section (lyric-section.js; file format
+ *    §9.17, engine spec §5.5.3 "Lyric instruments") ── */
+
+#define LYRIC_SYLLABLE_BYTES 12
+#define LYRIC_RECIPE_BYTES 12
+
+typedef struct {
+    int front, open, round;
+    bool vowel, nasal;
+    int gr;                     /* the tract block's +53 */
+    uint8_t cons[3];            /* onset 1, onset 2, coda */
+    uint8_t timing[4];          /* onset 1, onset 2, coda, glide */
+} TaudLyricSyllable;
+
+/* A consonant slot's layout (§7.6): the noise consonant `cons` reads. */
+typedef struct {
+    int cons;
+    uint32_t ptr;
+    int len, offset, rate, tilt, gain;
+} TaudLyricRecipe;
+
+typedef struct {
+    int instId;
+    int numSyllables, numRecipes;
+    TaudLyricSyllable *syllables;
+    TaudLyricRecipe *recipes;
+    /* The first recipe for each consonant id, -1 for none (the generator). */
+    int16_t recipeOf[256];
+} TaudLyricEntry;
 
 typedef struct {
     int n;                      /* doubles used (2 per point) */
@@ -477,6 +516,14 @@ typedef struct TaudInst {
     TaudOplPatch *opl;          /* NULL unless a type-8 OPL instrument */
     TaudPsgPatch *psg;          /* NULL unless a type-9 PSG instrument */
     TaudFormantPatch *formant;  /* NULL unless a type-1 formant instrument */
+    /* Lyric instrument: the `ILyr` entry installed (te_set_lyrics), kept
+     * across record loads, and — while the record is a formant instrument —
+     * one patch per syllable, refreshed in place on every load. `lyric` is
+     * NULL for any other instrument; lyricStore is the storage it points at. */
+    const TaudLyricEntry *lyricEntry;
+    TaudFormantPatch *lyric;
+    TaudFormantPatch *lyricStore;
+    int lyricStoreCount;
 
     /* Invert loop (S $F0xx). invertMaskLen 0 = no mask. */
     uint8_t *invertMask;
@@ -677,6 +724,10 @@ struct TaudVoice {
     /* Formant tract (item 212): NULL or &formantStore. */
     TaudFormantState *formant;
     TaudFormantState formantStore;
+    /* A lyric instrument's place in its lyrics on this LANE: the syllable the
+     * lane's next trigger of it sings. Read and written on the foreground
+     * voice only. */
+    int lyricPos;
 
     int noteVolume, channelVolume, rowVolume;
     int channelPan, rowPan;
@@ -1258,6 +1309,7 @@ void te_set_surround_model(TaudEngine *e, int model);
 void te_set_monitor_mode(TaudEngine *e, int mode);
 void te_set_mastering(TaudEngine *e, const TaudMastering *params);
 void te_set_imix(TaudEngine *e, const TaudImixBlock *blocks, int count);
+void te_set_lyrics(TaudEngine *e, const TaudLyricEntry *entries, int count);
 void te_sync_imix_routes(TaudEngine *e);
 void te_imix_free_routes(TaudEngine *e);
 void te_imix_reset_chains(TaudEngine *e);
@@ -1315,6 +1367,7 @@ static inline double minifloat_to_double(int index) { return (double)MINIFLOAT_L
 void te_inst_init(TaudInst *inst, int index);
 void te_inst_free(TaudInst *inst);
 void te_inst_load_record(TaudInst *inst, const uint8_t *b);
+void te_inst_set_lyric(TaudInst *inst, const TaudLyricEntry *entry);
 int te_parse_patches_blob(const uint8_t *bytes, size_t len, TaudPatch **out);
 const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, int noteVal, int rowVolume);
 const TaudPatch *te_patch_at(const TaudInst *inst, int patchIndex);
@@ -1484,6 +1537,8 @@ const TaudInst *te_formant_chip_source(const TaudEngine *e, const TaudInst *inst
 int te_formant_chip_rate(const TaudInst *src);
 void te_formant_key_source(TaudFormantState *st, const TaudInst *chip);
 void te_formant_relatch_source(TaudFormantState *st, const TaudInst *chip);
+void te_formant_lyric_syllable(const TaudFormantPatch *rec, const TaudLyricSyllable *syl,
+                               const TaudLyricEntry *entry, TaudFormantPatch *out);
 double te_render_formant_voice(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, int64_t frame);
 
 /* spatial.c */
@@ -1525,7 +1580,8 @@ int te_row_volume_from_default(const TaudInst *inst, const TaudPatch *patch, int
 void te_cap_background_voices(TaudEngine *e);
 void te_cut_layer_children(TaudEngine *e, int vi);
 void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, int noteVal, int instId, int rowVolOverride);
-void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride);
+void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride,
+                     const TaudFormantPatch *lyricPatch);
 int te_narrow_vol_axis(const TaudEngine *e, int v);
 void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note);
 void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel, int incomingInst);
@@ -1597,6 +1653,8 @@ typedef struct {
     char *projectName;
     int numImix;
     TaudImixBlock *imix;        /* the IMix section's valid blocks, owned */
+    int numLyrics;
+    TaudLyricEntry *lyrics;     /* the ILyr section's valid entries, owned */
 } TaudDoc;
 
 TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc);

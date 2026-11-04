@@ -40,8 +40,13 @@ void te_inst_free(TaudInst *inst)
     free(inst->opl);
     free(inst->psg);
     free(inst->formant);
+    free(inst->lyricStore);
     free(inst->invertMask);
     free(inst->modMask);
+    inst->lyricStore = NULL;
+    inst->lyricStoreCount = 0;
+    inst->lyric = NULL;
+    inst->lyricEntry = NULL;
     inst->opl = NULL;
     inst->psg = NULL;
     inst->formant = NULL;
@@ -400,8 +405,45 @@ static void load_formant_record(TaudInst *inst, const uint8_t *b)
     load_typed_record(inst, b);
 }
 
+/* Re-derive the lyric syllables from the record as it now stands, in place
+ * where the count allows (Microtone 4.7.0, `ILyr`). */
+static void refresh_lyric(TaudInst *inst)
+{
+    const TaudLyricEntry *e = inst->lyricEntry;
+    int i;
+    if (inst->formant == NULL || e == NULL) { inst->lyric = NULL; return; }
+    if (inst->lyricStore == NULL || inst->lyricStoreCount != e->numSyllables) {
+        TaudFormantPatch *p = (TaudFormantPatch *)calloc((size_t)e->numSyllables, sizeof *p);
+        if (p == NULL) { inst->lyric = NULL; return; }
+        /* The engine only ever installs the lyrics of the document it loads,
+         * at load, so no voice still sings from the storage dropped here. */
+        free(inst->lyricStore);
+        inst->lyricStore = p;
+        inst->lyricStoreCount = e->numSyllables;
+    }
+    for (i = 0; i < e->numSyllables; i++) {
+        te_formant_lyric_syllable(inst->formant, &e->syllables[i], e, &inst->lyricStore[i]);
+    }
+    inst->lyric = inst->lyricStore;
+}
+
+/** Install (or, with NULL, drop) this instrument's `ILyr` entry. */
+void te_inst_set_lyric(TaudInst *inst, const TaudLyricEntry *entry)
+{
+    inst->lyricEntry = entry != NULL && entry->numSyllables > 0 ? entry : NULL;
+    refresh_lyric(inst);
+}
+
+static void load_record(TaudInst *inst, const uint8_t *b);
+
 /** Load a full 256-byte record; detects the Metainstrument sentinel. */
 void te_inst_load_record(TaudInst *inst, const uint8_t *b)
+{
+    load_record(inst, b);
+    refresh_lyric(inst);
+}
+
+static void load_record(TaudInst *inst, const uint8_t *b)
 {
     uint32_t sp = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
     inst->cutoffOverride = -1;

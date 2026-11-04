@@ -97,7 +97,90 @@ void te_doc_free(TaudDoc *doc)
     free(doc->ixmp);
     free(doc->projectName);
     free(doc->imix);
+    for (i = 0; i < doc->numLyrics; i++) {
+        free(doc->lyrics[i].syllables);
+        free(doc->lyrics[i].recipes);
+    }
+    free(doc->lyrics);
     memset(doc, 0, sizeof *doc);
+}
+
+/* The `ILyr` section (§9.17, lyric-section.js parseLyricSection): entries
+ * back to back, {U16 instrument (bits 0…9), U32 L, then L bytes: U16 S, U8 R,
+ * U8 0, R × 12 recipes, S × 12 syllables, the editor's tail (ignored)}. An
+ * entry with no syllable or shorter than its counts is dropped, and so is a
+ * second entry for an instrument; a truncated one ends the walk. Returns the
+ * entries kept, or -1 out of memory. */
+static int parse_lyrics(const uint8_t *pl, size_t len, TaudLyricEntry **out)
+{
+    TaudLyricEntry *list = NULL;
+    int n = 0, cap = 0;
+    bool seen[1024];
+    size_t o = 0;
+    memset(seen, 0, sizeof seen);
+    *out = NULL;
+    while (len - o >= 6) {
+        int instId = (int)(rd_u16(pl + o) & 0x3ff);
+        size_t L = rd_u32(pl + o + 2), start = o + 6;
+        const uint8_t *b = pl + start;
+        size_t S, R, fixedEnd, k;
+        TaudLyricEntry *e;
+        if (L > len - start) break;
+        o = start + L;
+        if (L < 4) continue;
+        S = rd_u16(b);
+        R = b[2];
+        fixedEnd = 4 + R * LYRIC_RECIPE_BYTES + S * LYRIC_SYLLABLE_BYTES;
+        if (S == 0 || fixedEnd > L || seen[instId]) continue;
+        seen[instId] = true;
+        if (n == cap) {
+            int nc = cap ? cap * 2 : 8;
+            TaudLyricEntry *nl = (TaudLyricEntry *)realloc(list, sizeof *nl * (size_t)nc);
+            if (nl == NULL) goto oom;
+            list = nl;
+            cap = nc;
+        }
+        e = &list[n];
+        memset(e, 0, sizeof *e);
+        e->instId = instId;
+        e->numSyllables = (int)S;
+        e->numRecipes = (int)R;
+        e->syllables = (TaudLyricSyllable *)calloc(S, sizeof *e->syllables);
+        e->recipes = R > 0 ? (TaudLyricRecipe *)calloc(R, sizeof *e->recipes) : NULL;
+        n++;
+        if (e->syllables == NULL || (R > 0 && e->recipes == NULL)) goto oom;
+        for (k = 0; k < 256; k++) e->recipeOf[k] = -1;
+        for (k = 0; k < R; k++) {
+            const uint8_t *r = b + 4 + k * LYRIC_RECIPE_BYTES;
+            TaudLyricRecipe *rc = &e->recipes[k];
+            rc->cons = r[0];
+            rc->ptr = (uint32_t)r[1] | ((uint32_t)r[2] << 8) | ((uint32_t)r[3] << 16);
+            rc->len = (int)rd_u16(r + 4);
+            rc->offset = (int)rd_u16(r + 6);
+            rc->rate = (int)rd_u16(r + 8);
+            rc->tilt = r[10] >= 0x80 ? r[10] - 0x100 : r[10];
+            rc->gain = r[11];
+            if (rc->cons != 0 && e->recipeOf[rc->cons] < 0) e->recipeOf[rc->cons] = (int16_t)k;
+        }
+        for (k = 0; k < S; k++) {
+            const uint8_t *y = b + 4 + R * LYRIC_RECIPE_BYTES + k * LYRIC_SYLLABLE_BYTES;
+            TaudLyricSyllable *sy = &e->syllables[k];
+            sy->front = y[0];
+            sy->open = y[1];
+            sy->round = y[2];
+            sy->vowel = (y[3] & 0x01) != 0;
+            sy->nasal = (y[3] & 0x02) != 0;
+            sy->gr = y[4];
+            memcpy(sy->cons, y + 5, 3);
+            memcpy(sy->timing, y + 8, 4);
+        }
+    }
+    *out = list;
+    return n;
+oom:
+    while (n-- > 0) { free(list[n].syllables); free(list[n].recipes); }
+    free(list);
+    return -1;
 }
 
 typedef struct { char fourcc[4]; size_t off, len; } Section;
@@ -333,6 +416,13 @@ TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc)
         if (n < 0) { err = TAUD_ERR_NOMEM; goto fail; }
         doc->numImix = n;
     }
+    /* …and the lyric instruments' lyrics (§9.17), for the same reason. */
+    sec = find_sec(secs, nSecs, "ILyr");
+    if (sec != NULL) {
+        int n = parse_lyrics(doc->projData + sec->off, sec->len, &doc->lyrics);
+        if (n < 0) { err = TAUD_ERR_NOMEM; goto fail; }
+        doc->numLyrics = n;
+    }
     free(secs);
     return TAUD_OK;
 
@@ -387,6 +477,8 @@ void te_load_into_engine(TaudEngine *e, const TaudDoc *doc, int songIndex)
     te_set_mastering(e, song->hasMastering ? &song->mastering : NULL);
     /* …and the instruments' mixing chains (item 217), for the same reason. */
     te_set_imix(e, doc->imix, doc->numImix);
+    /* …and the lyric instruments' lyrics: which syllable a note sings. */
+    te_set_lyrics(e, doc->lyrics, doc->numLyrics);
 
     for (p = 0; p < doc->numIxmp; p++) {
         te_upload_instrument_patches(e, doc->ixmp[p].instId, doc->ixmp[p].blob, doc->ixmp[p].len);

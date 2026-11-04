@@ -685,6 +685,25 @@ unsigned te_drain_interrupts(TaudEngine *e)
 
 bool te_render_chunk(TaudEngine *e) { return te_generate_tracker_audio(e); }
 
+/* Install the project's LYRICS (the `ILyr` section, §9.17): `count` decoded
+ * entries, replacing whatever was installed — an instrument no entry names
+ * has none. The first entry for an instrument wins. The entries must outlive
+ * the engine's use of them (the player's document owns them). */
+void te_set_lyrics(TaudEngine *e, const TaudLyricEntry *entries, int count)
+{
+    const TaudLyricEntry *by[NUM_INST_SLOTS];
+    int i;
+    for (i = 0; i < NUM_INST_SLOTS; i++) by[i] = NULL;
+    for (i = 0; i < count; i++) {
+        int id = entries[i].instId & 0x3ff;
+        if (id < NUM_INST_SLOTS && by[id] == NULL) by[id] = &entries[i];
+    }
+    for (i = 0; i < NUM_INST_SLOTS; i++) {
+        TaudInst *inst = &e->instruments[i];
+        if (by[i] != inst->lyricEntry) te_inst_set_lyric(inst, by[i]);
+    }
+}
+
 /* ── lifetime ── */
 
 TaudEngine *te_engine_new(int rate)

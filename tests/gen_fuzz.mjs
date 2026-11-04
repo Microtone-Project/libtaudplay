@@ -5,7 +5,8 @@
 // (stereo included), layered and FM metainstruments (chip operators
 // included), OPL, PSG and formant instruments (sung from a sample or from a
 // chip), table kinds the engine does not know, sample modifications,
-// interrupts, mastering and instrument mixing chains (IMix, valid and not).
+// interrupts, mastering, instrument mixing chains (IMix, valid and not) and
+// lyric instruments (ILyr, valid and not).
 //
 //   node tests/gen_fuzz.mjs <microtone-taudplay> SEED OUT.taud
 //
@@ -18,6 +19,7 @@ import { resolve } from "node:path";
 const [root, seedArg, out] = process.argv.slice(2);
 const { gzipSync } = await import(pathToFileURL(resolve(root, "core/vendor/fflate.esm.js")).href);
 const IMX = await import(pathToFileURL(resolve(root, "core/format/imix-section.js")).href);
+const LYR = await import(pathToFileURL(resolve(root, "core/format/lyric-section.js")).href);
 
 let seed = (+seedArg >>> 0) || 1;
 const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
@@ -682,6 +684,46 @@ if (chance(0.6)) {
   sec("sMst", payload);
 }
 if (imixSection.length) sec("IMix", Uint8Array.from(imixSection));
+
+// ── lyric instruments (ILyr) ──
+// Drawn last, so the rest of a seed's song is what it was before lyrics.
+// FUZZ_LYRIC=0 leaves them out, FUZZ_LYRIC=1 always has them. Entries go to
+// formant instruments mostly, now and then to another kind (ignored); recipes
+// repeat a consonant (the first wins) and leave some unread (the generator);
+// a second entry for an instrument, an empty one, a short one and a
+// truncated tail are all dropped by a reader.
+if (process.env.FUZZ_LYRIC !== "0" && chance(process.env.FUZZ_LYRIC ? 1 : 0.6)) {
+  const bytes = [];
+  const targets = [...formantInsts, ...formantInsts, ...formantInsts, pick(sampleInsts), pick(oplInsts)];
+  const syllable = () => ({
+    front: ri(0, 255), open: ri(0, 255), round: ri(0, 255),
+    vowel: chance(0.85), nasal: chance(0.2),
+    gr: (chance(0.5) ? ri(0, 7) : 0) | (ri(0, 3) << 3) | (ri(0, 3) << 5) | (chance(0.3) ? 0x80 : 0),
+    cons: [pick(CONS_IDS), pick(CONS_IDS), pick(CONS_IDS)],
+    timing: [0, 0, 0, 0].map(() => pick([128, ri(64, 192), ri(0, 255)])),
+  });
+  const recipe = () => {
+    const ns = samples[ri(0, samples.length - 1)];
+    return {
+      cons: pick(CONS_IDS), ptr: ns.ptr, len: ns.len, offset: chance(0.5) ? 0 : ri(0, ns.len),
+      rate: chance(0.1) ? 0 : ri(2000, 48000), tilt: chance(0.5) ? 0 : ri(-128, 127), gain: chance(0.5) ? 0 : ri(0, 255),
+    };
+  };
+  const n = ri(2, 6);
+  for (let k = 0; k < n; k++) {
+    const entry = {
+      instId: pick(targets),
+      syllables: Array.from({ length: pick([1, 2, ri(3, 12)]) }, syllable),
+      recipes: Array.from({ length: ri(0, 5) }, recipe),
+    };
+    const b = LYR.buildLyricEntry(entry);
+    if (chance(0.08)) { b[6] = 0; b[7] = 0; }                     // no syllable: invalid
+    else if (chance(0.06)) { b[6] = 0xff; b[7] = 0x00; }          // more syllables than bytes
+    bytes.push(...b);
+  }
+  if (chance(0.1)) bytes.push(...[ri(0, 255), 0, ri(1, 255), 0, 0, 0]);   // truncated tail
+  sec("ILyr", Uint8Array.from(bytes));
+}
 const projHeader = new Uint8Array(16);
 projHeader.set([0x1e, 0x54, 0x61, 0x75, 0x64, 0x50, 0x72, 0x4a]);
 const projOff = off;

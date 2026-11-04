@@ -1283,8 +1283,9 @@ typedef struct {
     bool hasP, hasShape;
     int shapeCurve;
     double shapeBias;
-    double u1[TE_MAX_BUS_CH], dcX[TE_MAX_BUS_CH], dcY[TE_MAX_BUS_CH];
-    double gIn, gOut, fb, dcR;
+    double u1[TE_MAX_BUS_CH];
+    double dcM[TE_MAX_BUS_CH];      /* the DC blocker's running mean */
+    double gIn, gOut, fb, dcA;
 } ImxSat;
 
 static void sat_configure(ImxSat *s, const TaudImxEquipment *p, double rate)
@@ -1295,8 +1296,11 @@ static void sat_configure(ImxSat *s, const TaudImxEquipment *p, double rate)
     s->gIn = te_db_to_gain(p->u.sat.inDb) * te_db_to_gain(p->u.sat.driveDb);
     s->gOut = te_db_to_gain(p->u.sat.outDb);
     s->fb = sat_f(p->u.sat.curve, p->u.sat.bias);
-    /* A 5 Hz DC blocker follows an asymmetric curve. */
-    s->dcR = 1 - (2 * PI * 5) / rate;
+    /* The mix tool's DC blocker follows every curve (Microtone 4.7.0): the
+     * offset an uneven shape or a bias adds depends on the signal, and a
+     * biased INPUT comes out biased by any curve — either way an offset would
+     * eat the headroom of a limiter after it. */
+    s->dcA = (IMX_DC_K * IMX_DC_HZ) / rate;
     if (!s->hasShape || s->shapeCurve != p->u.sat.curve || s->shapeBias != p->u.sat.bias) {
         s->hasShape = true;
         s->shapeCurve = p->u.sat.curve;
@@ -1310,8 +1314,7 @@ static void sat_reset(ImxSat *s)
     int c;
     for (c = 0; c < TE_MAX_BUS_CH; c++) {
         s->u1[c] = s->hasP ? s->p.u.sat.bias : 0;
-        s->dcX[c] = 0;
-        s->dcY[c] = 0;
+        s->dcM[c] = 0;
     }
 }
 
@@ -1319,14 +1322,14 @@ static void sat_process(ImxSat *s, double *data, int stride, int n0, int n1, con
 {
     int nch = ctx->nch, c, n;
     int curve = s->p.u.sat.curve;
-    double bias = s->p.u.sat.bias, gIn = s->gIn, gOut = s->gOut, fb = s->fb, R = s->dcR;
-    bool dc = bias != 0 || curve == SAT_TUBE;
+    double bias = s->p.u.sat.bias, gIn = s->gIn, gOut = s->gOut, fb = s->fb;
+    double a = s->dcA, b = 1 - a;
     if (ctx->dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
     for (c = 0; c < nch; c++) {
         int o = c * stride;
         double u1 = s->u1[c];
         double F1 = sat_ad(curve, u1);
-        double dx = s->dcX[c], dy = s->dcY[c];
+        double m = s->dcM[c];
         for (n = n0; n < n1; n++) {
             double u = data[o + n] * gIn + bias;
             double d = u - u1;
@@ -1340,14 +1343,15 @@ static void sat_process(ImxSat *s, double *data, int stride, int n0, int n1, con
             }
             u1 = u; F1 = F0;
             y -= fb;
-            if (dc) {
-                double yy = y - dx + R * dy;
-                dx = y; dy = yy; y = yy;
+            /* Opus's dc_reject, as the mix tool runs it. */
+            {
+                double yy = y - m;
+                m = a * y + b * m;
+                data[o + n] = yy * gOut;
             }
-            data[o + n] = y * gOut;
         }
         s->u1[c] = u1;
-        s->dcX[c] = dx; s->dcY[c] = dy;
+        s->dcM[c] = m;
     }
     mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, ctx->dry);
 }

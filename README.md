@@ -286,10 +286,13 @@ where it has the flag, see [Numerics](#numerics)) runs:
   racks with DSP-only principals and programs filling their area to byte 253,
   every effect command, mastering chains, and instrument mixing chains of
   every piece, in both pipeline orders, separate and bus mode, with unknown
-  pieces and randomly corrupted blocks among them), and both implementations
-  must render them identically. `FUZZ_IMIX=1` puts chains in every song,
+  pieces and randomly corrupted blocks among them, and lyric instruments —
+  `ILyr` entries with recipes shared, missing and repeated, on formant
+  instruments and on others, with empty, short and duplicate entries among
+  them), and both implementations must render them identically. `FUZZ_IMIX=1` puts chains in every song,
   `FUZZ_IMIX=0` in none, and `FUZZ_IMIX_KINDS=tsh1,expd` (any FourCCs) draws
   their equipment from those pieces alone.
+  `FUZZ_LYRIC=1` gives every song lyrics, `FUZZ_LYRIC=0` none.
   `FUZZ_INSTS=opl`, `psg`, `formant` or `fm` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
@@ -317,7 +320,7 @@ in spans between ticks; this one runs a frame at a time and finishes each span
 — the instrument buses, the fold-down, the Amiga filters — just before the
 tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 4.1.0 (Microtone.js 4.1.0, engine 3131d0f7d915). The
+In step with taudplay 4.7.0 (Microtone.js 4.7.0, engine d9a64e6f4ff3). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.
@@ -327,6 +330,17 @@ engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 LGPL-3.0-or-later — see `COPYING.LESSER` (and `COPYING` for the GPL text it
 builds on). You may link this library into a proprietary program; changes *to
 the library itself* must be shared.
+
+Where the LGPL does not fit — a console title, a static build, changes to the
+library you cannot publish — taudplay-c is also available under a proprietary
+licence: write to <microtone@curioustorvald.com>. It is offered beside the
+LGPL, never instead of it.
+
+Contributions are welcome once their author has agreed to the
+[Microtone Contributor Licence Agreement](https://github.com/Microtone-Project/Microtone.js/blob/master/CLA.md):
+you keep your copyright, and what is merged stays LGPL. Changes to how the
+engine behaves go to [Microtone.js](https://github.com/Microtone-Project/Microtone.js),
+where it is authored; this library follows it.
 
 `src/jsmath.c` is derived from fdlibm, Copyright © 1993 Sun Microsystems, Inc.
 ("Permission to use, copy, modify, and distribute this software is freely

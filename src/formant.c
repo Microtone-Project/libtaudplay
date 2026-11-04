@@ -58,9 +58,19 @@
 static int fu16(const uint8_t *b, int o) { return b[o] | (b[o + 1] << 8); }
 static uint32_t fu24(const uint8_t *b, int o) { return (uint32_t)b[o] | ((uint32_t)b[o + 1] << 8) | ((uint32_t)b[o + 2] << 16); }
 
+/* The glide, the articulations and R (the block's +53, a lyric syllable's
+ * +4) into `patch`; a glide code 5…7 is RESERVED and sounds as none. */
+static void decode_gr(TaudFormantPatch *patch, int gr)
+{
+    patch->semivowel = (gr & 7) <= 4 ? gr & 7 : 0;
+    patch->secondary = (gr >> 3) & 3;
+    patch->codaArt = (gr >> 5) & 3;
+    patch->rhotic = (gr & 0x80) != 0;
+}
+
 void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch)
 {
-    int gr = raw[FB_GR], i;
+    int i;
     patch->srcPtr = fu24(raw, FB_SOURCE);
     patch->front = raw[FB_FRONT];
     patch->open = raw[FB_OPEN];
@@ -72,10 +82,7 @@ void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch)
     patch->timing = raw[FB_TIMING];
     patch->rangeLo = fu24(raw, FB_RANGE_LO);
     patch->rangeHi = fu24(raw, FB_RANGE_HI);
-    patch->semivowel = (gr & 7) <= 4 ? gr & 7 : 0;
-    patch->secondary = (gr >> 3) & 3;
-    patch->codaArt = (gr >> 5) & 3;
-    patch->rhotic = (gr & 0x80) != 0;
+    decode_gr(patch, raw[FB_GR]);
     for (i = 0; i < FORMANT_SLOTS; i++) {
         const uint8_t *o = raw + FB_SLOTS + i * FORMANT_SLOT_BYTES;
         TaudFormantSlot *s = &patch->slots[i];
@@ -854,6 +861,55 @@ static void after_release(TaudFormantSegment *sg, double rel, double v0, double 
 
 static double timing_scale(int b) { return js_pow(2, (b - 128) / 64.0); }
 
+/* The timing scale of slot `i` (0, 1 the onset, 2 the coda, 3 the glide):
+ * the record's, times a lyric syllable's own for the slot. */
+static double slot_scale(const TaudFormantPatch *patch, int i)
+{
+    double k = timing_scale(patch->timing);
+    return patch->hasSlotTiming ? k * timing_scale(patch->slotTiming[i]) : k;
+}
+
+/* A LYRIC SYLLABLE (spec §5.5.3, "Lyric instruments"): the record's patch
+ * `rec` with syllable `syl` of its `ILyr` entry in place — the vowel, whether
+ * there is one and whether it is nasalised, the glide, the articulations, R,
+ * the three consonants with the noise each reads (the entry's recipes; a
+ * consonant with none sounds the generator) and the four timing bytes.
+ * Everything else is the record's. Written into `out` IN PLACE, so that a
+ * note singing it follows a reload of the record. */
+void te_formant_lyric_syllable(const TaudFormantPatch *rec, const TaudLyricSyllable *syl,
+                               const TaudLyricEntry *entry, TaudFormantPatch *out)
+{
+    int i;
+    out->srcPtr = rec->srcPtr;
+    out->srcInst = rec->srcInst;
+    out->front = syl->front & 0xff;
+    out->open = syl->open & 0xff;
+    out->round = syl->round & 0xff;
+    out->track = rec->track;
+    out->refNote = syl->vowel ? ref_note(rec) : 0;
+    out->nasal = syl->nasal;
+    out->glide = rec->glide;
+    out->timing = rec->timing;
+    out->rangeLo = rec->rangeLo;
+    out->rangeHi = rec->rangeHi;
+    decode_gr(out, syl->gr & 0xff);
+    for (i = 0; i < FORMANT_SLOTS; i++) {
+        TaudFormantSlot *s = &out->slots[i];
+        int cons = syl->cons[i];
+        const TaudLyricRecipe *r = cons != 0 && entry->recipeOf[cons] >= 0 ? &entry->recipes[entry->recipeOf[cons]] : NULL;
+        s->cons = cons;
+        s->ptr = r != NULL ? r->ptr & 0xffffff : 0;
+        s->len = r != NULL ? r->len & 0xffff : 0;
+        s->offset = r != NULL ? r->offset & 0xffff : 0;
+        s->rate = r != NULL ? r->rate & 0xffff : 0;
+        s->tilt = r != NULL ? r->tilt : 0;
+        s->gain = r != NULL ? r->gain & 0xff : 0;
+    }
+    out->hasSlotTiming = true;
+    for (i = 0; i < 4; i++) out->slotTiming[i] = syl->timing[i];
+    out->lyricOf = rec;
+}
+
 /* ── loudness tables ── */
 
 #define NORM_EVERY 8
@@ -1013,7 +1069,6 @@ static void silent_coda(TaudFormantSegment *seg)
 
 void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch)
 {
-    double k = timing_scale(patch->timing);
     bool vowel = has_vowel(patch), coda = true, nasal;
     const TaudConsonant *rows[2];
     int rowSlot[2], nrows = 0, i, next;
@@ -1035,6 +1090,7 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     nasal = vowel && patch->nasal;
     if (st->sv != 0) {
         const TaudConsonant *r = consonant(SEMIVOWELS[st->sv].row);
+        double k = slot_scale(patch, 3);
         double dur = r->dur * k, tr = r->trans * k;
         st->svEnd = dur + tr;
         tr_reset(&st->svW);
@@ -1051,6 +1107,7 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     for (i = nrows - 1; i >= 0; i--) {
         TaudFormantSegment *s = &st->onset[i];
         int art = i == nrows - 1 ? patch->secondary : ART_NONE;
+        double k = slot_scale(patch, rowSlot[i]);
         s->row = rows[i];
         s->slot = patch->slots[rowSlot[i]];
         if (!vowel && i == nrows - 1) nucleus_tracks(rows[i], i == 0, k, art, s);
@@ -1067,7 +1124,7 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     st->seg = 0;
     st->nucleus = !vowel && nrows > 0 ? nrows - 1 : -1;
     st->held = false;
-    st->hasCoda = coda ? build_coda(st, patch, k) : false;
+    st->hasCoda = coda ? build_coda(st, patch, slot_scale(patch, 2)) : false;
     st->phase = nrows > 0 ? PHASE_ONSET : PHASE_VOWEL;
     st->t = 0.0;
     st->codaVeto = false;
@@ -1194,7 +1251,7 @@ void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     if (st->glideLeft > 0) { st->ownVowel = true; st->rejoin = true; }
     else { st->ownVowel = false; st->rejoin = false; }
     if (st->phase == PHASE_ONSET || st->phase == PHASE_VOWEL) {
-        st->hasCoda = build_coda(st, patch, timing_scale(patch->timing));
+        st->hasCoda = build_coda(st, patch, slot_scale(patch, 2));
     }
 }
 

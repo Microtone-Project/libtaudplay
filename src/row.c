@@ -34,6 +34,7 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
 {
     int seedVol;
     const TaudInst *formantChip;
+    const TaudFormantPatch *tract;
     te_apply_active_sample(v, newInst, newPatch);
     /* A formant instrument sung from a chip instrument takes the chip's C2SPD
      * where its sample's rate would be, as on a trigger (trigger.c). */
@@ -68,14 +69,24 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
     }
     /* A formant voice keeps saying its syllable under the new record's tract;
      * a sampled note handed one starts its tract at the vowel. Its source
-     * follows the record, a chip channel taking a new patch where it stands. */
+     * follows the record, a chip channel taking a new patch where it stands.
+     *
+     * A LYRIC instrument's byte starts its lyrics over. The tract it hands
+     * over is the syllable the note is already singing, when that is one of
+     * this instrument's; otherwise its first syllable. */
+    tract = newInst->formant;
+    if (newInst->lyric != NULL) {
+        const TaudFormantPatch *cur = v->formant != NULL ? v->formant->patch : NULL;
+        v->lyricPos = 0;
+        tract = cur != NULL && cur->lyricOf == newInst->formant ? cur : &newInst->lyric[0];
+    }
     if (newInst->formant != NULL && v->formant != NULL) {
-        te_formant_relatch(e, v->formant, newInst->formant);
+        te_formant_relatch(e, v->formant, tract);
         te_formant_relatch_source(v->formant, formantChip);
     } else if (newInst->formant != NULL) {
         v->formant = &v->formantStore;
         te_formant_state_init(v->formant);
-        te_formant_start_at_vowel(e, v->formant, newInst->formant);
+        te_formant_start_at_vowel(e, v->formant, tract);
         te_formant_key_source(v->formant, formantChip);
     } else {
         v->formant = NULL;

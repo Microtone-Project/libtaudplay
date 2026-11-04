@@ -8,7 +8,8 @@
  * [notePan, noteElevation, present]. Read only by triggerMetaOrNote. */
 typedef struct { double pan, elevation; bool present; } NotePanSeed;
 
-static void trigger_note_seed(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride, NotePanSeed *seed);
+static void trigger_note_seed(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride, NotePanSeed *seed,
+                              const TaudFormantPatch *lyricPatch);
 
 void te_apply_active_sample(TaudVoice *v, const TaudInst *inst, const TaudPatch *patch);
 
@@ -233,6 +234,24 @@ static bool fm_sounds(TaudEngine *e, const TaudMetaLayer *o, int noteVal, int se
         seedVol >= o->volStart && seedVol <= o->volEnd;
 }
 
+/* The syllable a trigger of a LYRIC INSTRUMENT sings on the lane whose
+ * foreground voice is `voice` (spec §5.5.3, "Lyric instruments"), or NULL for
+ * any other instrument. An instrument byte starts the lyrics over; every
+ * trigger sings the syllable at the lane's position and moves it on, back to
+ * the first after the last. (The JS takes a lyricReset flag for the jam bank;
+ * this library has no jam, so it is always set.) */
+static const TaudFormantPatch *lyric_trigger(TaudVoice *voice, const TaudInst *inst, int instId)
+{
+    const TaudFormantPatch *syl;
+    int n;
+    if (inst->lyric == NULL) return NULL;
+    n = inst->lyricEntry->numSyllables;
+    if (instId != 0 || voice->lyricPos >= n) voice->lyricPos = 0;
+    syl = &inst->lyric[voice->lyricPos];
+    voice->lyricPos = voice->lyricPos + 1 >= n ? 0 : voice->lyricPos + 1;
+    return syl;
+}
+
 void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVal, int instId, int rowVolOverride)
 {
     const TaudInst *inst;
@@ -252,7 +271,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     te_drop_fm_operators(e, vi);
     inst = instId != 0 ? &e->instruments[instId] : &e->instruments[voice->instrumentId];
     if (!inst_is_meta(inst)) {
-        te_trigger_note(e, voice, noteVal, instId, rowVolOverride);
+        te_trigger_note(e, voice, noteVal, instId, rowVolOverride, lyric_trigger(voice, inst, instId));
         voice->layerMixGain = 1.0;
         voice->layerRelDetune = 0;
         voice->layerFixedNote = -1;
@@ -296,7 +315,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     chanPan = voice->channelPan; chanRowPan = voice->rowPan;
     chanPanbrello = voice->panbrelloOffset;
     chanAzimuth = voice->panAzimuth; chanElevation = voice->panElevation;
-    trigger_note_seed(e, voice, pitch_of(l0, noteVal), l0->instIdx, rowVolOverride, &seed);
+    trigger_note_seed(e, voice, pitch_of(l0, noteVal), l0->instIdx, rowVolOverride, &seed, NULL);
     l0HasPan = seed.present;
     l0Pan = l0HasPan ? seed.pan : 0;
     l0Elevation = l0HasPan ? seed.elevation : 0;
@@ -313,7 +332,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
         TaudVoice *child = te_voice_alloc(e);
         if (child == NULL) break;
         seed_child_lane_context(child, voice, chanPan, chanRowPan, chanPanbrello, chanAzimuth, chanElevation);
-        trigger_note_seed(e, child, pitch_of(lk, noteVal), lk->instIdx, rowVolOverride, &seed);
+        trigger_note_seed(e, child, pitch_of(lk, noteVal), lk->instIdx, rowVolOverride, &seed, NULL);
         child->isLayerChild = true;
         child->sourceChannel = vi;
         child->displayInst = voice->displayInst;
@@ -359,7 +378,7 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
     chanAzimuth = voice->panAzimuth; chanElevation = voice->panElevation;
     /* What each operator SOUNDS: the trigger at its ratio, or a FIXED-
      * frequency operator's own note (item 278, the DX7's FIXED mode). */
-    te_trigger_note(e, voice, pitch_of(&ops[0], noteVal), ops[0].instIdx, rowVolOverride);
+    te_trigger_note(e, voice, pitch_of(&ops[0], noteVal), ops[0].instIdx, rowVolOverride, NULL);
     voice->layerMixGain = 1.0;
     voice->layerRelDetune = 0;
     voice->layerFixedNote = ops[0].fixedPitch ? pitch_of(&ops[0], noteVal) : -1;
@@ -385,7 +404,7 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
         op = te_voice_alloc(e);
         if (op == NULL) break;
         seed_child_lane_context(op, voice, chanPan, chanRowPan, chanPanbrello, chanAzimuth, chanElevation);
-        te_trigger_note(e, op, pitch_of(&ops[k], noteVal), ops[k].instIdx, rowVolOverride);
+        te_trigger_note(e, op, pitch_of(&ops[k], noteVal), ops[k].instIdx, rowVolOverride, NULL);
         op->isLayerChild = true;
         op->fmOperator = true;
         op->fmParent = voice;
@@ -409,13 +428,15 @@ int te_narrow_vol_axis(const TaudEngine *e, int v)
     return iclamp(e->ts_wideCells ? asr32(v, 2) : v, 0, 0x3f);
 }
 
-void te_trigger_note(TaudEngine *e, TaudVoice *voice, int noteVal, int instId, int volOverride)
+void te_trigger_note(TaudEngine *e, TaudVoice *voice, int noteVal, int instId, int volOverride,
+                     const TaudFormantPatch *lyricPatch)
 {
     NotePanSeed seed;
-    trigger_note_seed(e, voice, noteVal, instId, volOverride, &seed);
+    trigger_note_seed(e, voice, noteVal, instId, volOverride, &seed, lyricPatch);
 }
 
-static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int instId, int volOverride, NotePanSeed *seed)
+static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int instId, int volOverride, NotePanSeed *seed,
+                              const TaudFormantPatch *lyricPatch)
 {
     bool mayCarry = voice->active && !voice->keyOff && !voice->noteFading &&
         (instId == 0 || instId == voice->instrumentId);
@@ -569,7 +590,8 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     /* A formant instrument (item 212): every trigger is a fresh syllable. */
     if (inst->formant != NULL) {
         if (voice->formant == NULL) { voice->formant = &voice->formantStore; te_formant_state_init(voice->formant); }
-        te_formant_note_on(e, voice->formant, inst->formant);
+        /* A lyric instrument's note sings the syllable its trigger chose. */
+        te_formant_note_on(e, voice->formant, lyricPatch != NULL ? lyricPatch : inst->formant);
         te_formant_key_source(voice->formant, formantChip);
     } else {
         voice->formant = NULL;
