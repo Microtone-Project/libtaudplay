@@ -282,7 +282,8 @@ where it has the flag, see [Numerics](#numerics)) runs:
   operators among them, table kinds the engine does not know, OPL channels of
   every kind, PSG pairs of every waveform with their `S $Axxx` register writes,
   formant instruments with every consonant manner — syllabic, nasalised,
-  glottalised, breathy, aspirated, sung from a sample or from a chip — FM
+  glottalised, breathy, aspirated, sung from a sample or from a chip, with
+  their `S $9xxx` nasalisation, r-colouring, held codas and glide times — FM
   racks with DSP-only principals and programs filling their area to byte 253,
   every effect command, mastering chains, and instrument mixing chains of
   every piece, in both pipeline orders, separate and bus mode, with unknown
@@ -293,6 +294,7 @@ where it has the flag, see [Numerics](#numerics)) runs:
   `FUZZ_IMIX=0` in none, and `FUZZ_IMIX_KINDS=tsh1,expd` (any FourCCs) draws
   their equipment from those pieces alone.
   `FUZZ_LYRIC=1` gives every song lyrics, `FUZZ_LYRIC=0` none.
+  `FUZZ_S9=1` makes `S $9xxx` half of every effect command, on most rows.
   `FUZZ_INSTS=opl`, `psg`, `formant` or `fm` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
@@ -320,7 +322,7 @@ in spans between ticks; this one runs a frame at a time and finishes each span
 — the instrument buses, the fold-down, the Amiga filters — just before the
 tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 4.7.0 (Microtone.js 4.7.0, engine d9a64e6f4ff3). The
+In step with taudplay 4.7.4 (Microtone.js 4.7.4, engine e583deb19b9a). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

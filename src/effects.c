@@ -403,6 +403,15 @@ static void apply_s_effect(TaudEngine *e, TaudVoice *voice, int vi, int arg)
             else if (v->psg != NULL && v->psg->patch != NULL) te_psg_write_register(v->psg->patch, arg & 0xfff);
         });
         break;
+    case 0x9:
+        /* S $9xxx — formant control (item 292), on every voice sounding a
+         * formant instrument, layer children included: $90kx sets the vowel's
+         * nasalisation and r-colouring and calls the coda, $91xx the note's
+         * glide time. On any other instrument it does nothing. */
+        FOR_EACH_LAYER_TARGET(e, voice, vi, v, {
+            if (v->formant != NULL) te_formant_command(e, v->formant, arg & 0xfff);
+        });
+        break;
     case 0x8:
         te_apply_pan_set(e, voice, arg & (e->ts_surroundModel == SURROUND_STEREO ? 0xff : 0x1ff));
         break;

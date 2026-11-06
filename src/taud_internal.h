@@ -425,13 +425,26 @@ typedef struct {
     TaudFormantTrack w, av, ah, af, nz;
     int next;
     int art;                    /* as blendInto reads it: ART_NONE, _PALATAL or _DARK */
-    double loop;                /* a held nucleus's repeat, ms (a trill's cycle) */
+    double loop;                /* a held nucleus's repeat, ms (a trill's cycle); a coda's, while held */
+    double hold;                /* a coda: where S $9010 holds it while the key is held */
     /* A coda after a hissing nucleus: its own noise starts this far in, the
      * nucleus's going on until then through the nucleus's bank. */
     double noiseAt;
     const struct TaudConsonant *prevRow;
     int prevArt;
 } TaudFormantSegment;
+
+/* How far the vowel is nasalised, or r-coloured (FormantAmount): 0 not at
+ * all, 1 fully, and between while S $90kx (item 292), or an instrument change,
+ * glides it. Until the note is given one of its own (`own`) it is the record's
+ * bit, read afresh every update; `rejoin` is an instrument change's glide,
+ * after which the note follows the new record again. */
+typedef struct {
+    bool own;
+    double v;                   /* where it stands */
+    double to, step, left;      /* where a glide is heading, per ms, ms to go */
+    bool rejoin;
+} TaudFormantAmount;
 
 #define CHIP_NONE 0
 #define CHIP_OPL 1
@@ -465,6 +478,14 @@ typedef struct {
     bool rejoin;
     double vFront, vOpen, vRound, gFront, gOpen, gRound, tFront, tOpen, tRound;
     double glideLeft;
+    /* S $9xxx (item 292): the vowel's nasalisation and r-colouring as the note
+     * has them, the glide time it was given (-1: the record's), and a coda
+     * called for while the key is still held. */
+    TaudFormantAmount nasAmt, rhoAmt;
+    int glideOv;
+    bool codaCall;
+    double codaZ0;              /* the vowel nasality the coda was built from */
+    bool atVowel;               /* started at the vowel (te_formant_start_at_vowel) */
     double av, avStep, ah, ahStep, af, afStep;
     double nv, nvStep, nvGoal;
     double nb, sg, sm;
@@ -481,7 +502,7 @@ typedef struct {
     double nTiltC, nGain, nZ;
     bool nGen;
     uint32_t nSeed;
-    double V[5], VB[5], F[5], B[5];
+    double V[5], VB[5], F[5], B[5], VR[5], VRB[5];
 } TaudFormantState;
 
 /* Sample-modification masks are sized per loop/sample and never exceed a
@@ -1528,11 +1549,12 @@ double te_render_psg_voice(TaudEngine *e, TaudVoice *v, int64_t frame);
 void te_formant_tables_init(TaudFormantTables *t, int rate);
 void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch);
 void te_formant_state_init(TaudFormantState *st);
-void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
+void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch, bool keep);
 void te_formant_restart(TaudEngine *e, TaudFormantState *st);
 void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
-void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch);
+void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch, bool keep);
 void te_formant_set_vowel(TaudFormantState *st, int f, int g, int r);
+void te_formant_command(TaudEngine *e, TaudFormantState *st, int arg);
 const TaudInst *te_formant_chip_source(const TaudEngine *e, const TaudInst *inst);
 int te_formant_chip_rate(const TaudInst *src);
 void te_formant_key_source(TaudFormantState *st, const TaudInst *chip);

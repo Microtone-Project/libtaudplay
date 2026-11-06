@@ -715,12 +715,19 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
     double tr = r->trans * k, dur = r->dur * k, end;
     bool glot = art == CODA_GLOTTAL;
     double gs = GLOT_STOP * k;
+    /* Where the coda HOLDS while the key does, after S $9010 (item 292): the
+     * end of the consonant's steady part — a stop in its closure, before the
+     * burst — and, for a trill, the cycle it repeats there (`loop`). */
+    double hold, loop = 0;
     tr_reset(w); tr_reset(av); tr_reset(ah); tr_reset(af); tr_reset(nz);
     switch (r->manner) {
     case MANNER_STOP:
     case MANNER_AFFRICATE: {
         double tc = tr + CLOSURE_MS * k;
         double tb = tc + r->burst * k;
+        /* A ms before the release: AT tc the burst's frication has already
+         * stepped on (the later of two points at one time holds). */
+        hold = tc - k;
         tr_at(tr_at(tr_at(w, 0, 0), tr, 0.5), tr + 5 * k, 1);
         if (glot) tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + gs, 0);
         else if (r->voiced) tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + 8 * k, 0.25), tc, 0.2), tc + 5 * k, 0);
@@ -749,6 +756,7 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
     }
     case MANNER_FRICATIVE: {
         double a = dmax(tr - 15 * k, 0);
+        hold = tr + dur;
         tr_at(tr_at(w, 0, 0), tr, 1);
         if (glot) tr_at(tr_at(tr_at(av, 0, v0), a, v0), a + gs, 0);
         else if (r->voiced) tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, r->av), tr + dur, 0.7 * r->av), tr + dur + 30 * k, 0);
@@ -764,6 +772,7 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
         break;
     }
     case MANNER_ASPIRATE:
+        hold = dur;
         tr_at(tr_at(w, 0, 0), 15 * k, 1);
         if (glot) tr_at(tr_at(av, 0, v0), gs, 0);
         else if (r->voiced) tr_at(tr_at(tr_at(tr_at(av, 0, v0), 20 * k, r->av), dur, 0.5 * r->av), dur + 20 * k, 0);
@@ -773,6 +782,7 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
         end = dur + 30 * k;
         break;
     case MANNER_NASAL:
+        hold = tr + dur;
         tr_at(tr_at(w, 0, 0), tr, 1);
         tr_at(tr_at(tr_at(nz, 0, z0), dmax(tr - 5 * k, 0), z0), tr, 1);
         tr_at(tr_at(tr_at(av, 0, v0), tr, r->av), tr + dur, 0.8 * r->av);
@@ -781,6 +791,7 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
         tr_at(ah, 0, 0); tr_at(af, 0, 0);
         break;
     case MANNER_APPROX:
+        hold = tr + dur;
         tr_at(tr_at(w, 0, 0), tr, 1);
         tr_at(tr_at(tr_at(av, 0, v0), tr, r->av), tr + dur, 0.8 * r->av);
         end = tr + dur + (glot ? gs : 40 * k);
@@ -792,15 +803,20 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
         tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, v0), tr + 3 * k, 0.2), tr + dur, 0.2);
         if (glot) {
             end = tr + dur + gs;
+            hold = tr + dur;
         } else {
             tr_at(av, tr + dur + 3 * k, 0.6);
             end = tr + dur + 40 * k;
+            hold = tr + dur + 3 * k;
         }
         tr_at(av, end, 0);
         tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), tr, 0);
         break;
     case MANNER_TRILL: {
         double c = dur, shut = c * 0.375;
+        /* [tr + shut, tr + c + shut) is one whole cycle, closure to closure. */
+        hold = tr + c + shut;
+        loop = c;
         tr_at(tr_at(w, 0, 0), tr, 1);
         tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(tr_at(av, 0, v0), tr, 0.7), tr + 3 * k, 0.12),
               tr + shut, 0.12), tr + shut + 3 * k, 0.7), tr + c - 3 * k, 0.7), tr + c, 0.12), tr + c + shut, 0.12);
@@ -819,10 +835,12 @@ static void coda_tracks_of(const TaudConsonant *r, double k, double v0, double z
         tr_at(tr_at(av, 0, v0), 6 * k, 0);
         tr_at(ah, 0, 0); tr_at(af, 0, 0); tr_at(tr_at(nz, 0, z0), 6 * k, 0);
         end = 6 * k;
+        hold = end;
         break;
     }
     sg->end = end;
-    sg->loop = 0;
+    sg->hold = dmin(hold, end);
+    sg->loop = hold < end ? loop : 0;
     tr_close(w, end, 1);
     tr_close(av, end, 0);
     tr_close(ah, end, 0);
@@ -852,6 +870,7 @@ static void shift_track(TaudFormantTrack *t, double rel, double v)
 static void after_release(TaudFormantSegment *sg, double rel, double v0, double a0, double h0, double z0)
 {
     sg->end = sg->end + rel;
+    sg->hold = sg->hold + rel;
     shift_track(&sg->w, rel, 0);
     shift_track(&sg->av, rel, v0);
     shift_track(&sg->ah, rel, h0);
@@ -1014,12 +1033,15 @@ void te_formant_state_init(TaudFormantState *st)
     st->nSeed = NOISE_SEED;
     st->nucleus = -1;
     st->srcKind = CHIP_NONE;
+    st->glideOv = -1;
 }
 
 /* The coda a record gives a note (buildCoda): slot 2's consonant, from the
  * vowel — or, in a syllable with no vowel, from its nucleus as it holds, a
- * hissing nucleus letting its hiss go first. False with no coda consonant. */
-static bool build_coda(TaudFormantState *st, const TaudFormantPatch *patch, double k)
+ * hissing nucleus letting its hiss go first. False with no coda consonant.
+ * `vz` is how nasalised the vowel is as the coda leaves it (0…1), when it has
+ * one. */
+static bool build_coda(TaudFormantState *st, const TaudFormantPatch *patch, double k, double vz)
 {
     const TaudConsonant *cr = consonant(patch->slots[2].cons);
     TaudFormantSegment *seg = &st->coda;
@@ -1035,7 +1057,8 @@ static bool build_coda(TaudFormantState *st, const TaudFormantPatch *patch, doub
     seg->prevRow = NULL;
     seg->prevArt = ART_NONE;
     if (st->nucleus < 0) {
-        double z0 = patch->nasal && has_vowel(patch) ? 1 : 0;
+        double z0 = has_vowel(patch) ? vz : 0;
+        st->codaZ0 = z0;
         coda_tracks(cr, k, 1, z0, art, seg);
         return true;
     }
@@ -1067,13 +1090,85 @@ static void silent_coda(TaudFormantSegment *seg)
     tr_push(&seg->nz, 0, 0);
 }
 
-void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch)
+/* The note's glide time in ms (glideMsOf): what S $91xx gave it, or its
+ * record's. */
+static double glide_ms_of(const TaudFormantState *st)
+{
+    return (st->glideOv >= 0 ? st->glideOv : st->patch != NULL ? st->patch->glide : 0) * 2;
+}
+
+/* A note's amount as its trigger starts it: its record's bit (amtReset). */
+static void amt_reset(TaudFormantAmount *a, bool on)
+{
+    a->own = false; a->v = on ? 1 : 0; a->to = a->v; a->step = 0.0; a->left = 0.0; a->rejoin = false;
+}
+
+/* Set an amount gliding to `to` over the note's glide time — at once on the
+ * note's first row, or with a glide of 0 (amtGlideTo). */
+static void amt_glide_to(const TaudFormantState *st, TaudFormantAmount *a, double to)
+{
+    double ms = glide_ms_of(st);
+    a->to = to;
+    if (st->fresh || ms <= 0) { a->v = to; a->left = 0.0; return; }
+    a->step = (to - a->v) / ms;
+    a->left = ms;
+}
+
+/* An instrument change: the amount glides to the new record's, which the note
+ * then follows (amtRelatch). */
+static void amt_relatch(const TaudFormantState *st, TaudFormantAmount *a, bool on)
+{
+    amt_glide_to(st, a, on ? 1 : 0);
+    if (a->left > 0) { a->own = true; a->rejoin = true; }
+    else { a->own = false; a->rejoin = false; }
+}
+
+/* One control update of an amount: a glide's step (the last landing exactly),
+ * or the record's bit while the note has none of its own (amtAdvance). */
+static void amt_advance(TaudFormantAmount *a, double dt, bool on)
+{
+    if (a->left > 0) {
+        if (a->left <= dt) {
+            a->v = a->to; a->left = 0.0;
+            if (a->rejoin) { a->own = false; a->rejoin = false; }
+        } else {
+            a->v += a->step * dt;
+            a->left -= dt;
+        }
+    } else if (!a->own) {
+        a->v = on ? 1 : 0;
+    }
+}
+
+/* Is the vowel the onset heads for nasalised, at all? The note's own nasality
+ * when it has one, else its record's bit (nasalOf). */
+static bool nasal_of(const TaudFormantState *st, const TaudFormantPatch *patch)
+{
+    return st->nasAmt.own ? st->nasAmt.v > 0 : patch->nasal;
+}
+
+/* Note-on: build the syllable. `keep` says the syllable again for the SAME
+ * note (Q's retrigger, or an S $90kx on the trigger row that changed the
+ * nasality the onset heads for): what S $9xxx gave the note stays its own,
+ * its glides stopping where they stand, as te_formant_restart keeps the
+ * vowel. */
+void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch, bool keep)
 {
     bool vowel = has_vowel(patch), coda = true, nasal;
     const TaudConsonant *rows[2];
     int rowSlot[2], nrows = 0, i, next;
     NextStart nx;
     st->patch = patch;
+    if (!keep) {
+        amt_reset(&st->nasAmt, patch->nasal);
+        amt_reset(&st->rhoAmt, patch->rhotic);
+        st->glideOv = -1;
+        st->codaCall = false;
+    } else {
+        st->nasAmt.left = 0.0; st->nasAmt.rejoin = false;
+        st->rhoAmt.left = 0.0; st->rhoAmt.rejoin = false;
+    }
+    st->atVowel = false;
     for (i = 0; i < 2; i++) {
         const TaudConsonant *r = consonant(patch->slots[i].cons);
         if (r != NULL) { rows[nrows] = r; rowSlot[nrows] = i; nrows++; }
@@ -1087,7 +1182,7 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     /* The glide, if any; a syllable with no vowel has none. */
     st->sv = vowel ? patch->semivowel : 0;
     st->svT = 0.0;
-    nasal = vowel && patch->nasal;
+    nasal = vowel && nasal_of(st, patch);
     if (st->sv != 0) {
         const TaudConsonant *r = consonant(SEMIVOWELS[st->sv].row);
         double k = slot_scale(patch, 3);
@@ -1113,6 +1208,7 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
         if (!vowel && i == nrows - 1) nucleus_tracks(rows[i], i == 0, k, art, s);
         else onset_tracks(rows[i], i == 0, &nx, k, art, s);
         s->art = tract_art(art);
+        s->hold = s->end;
         s->noiseAt = 0;
         s->prevRow = NULL;
         s->prevArt = ART_NONE;
@@ -1124,7 +1220,7 @@ void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     st->seg = 0;
     st->nucleus = !vowel && nrows > 0 ? nrows - 1 : -1;
     st->held = false;
-    st->hasCoda = coda ? build_coda(st, patch, slot_scale(patch, 2)) : false;
+    st->hasCoda = coda ? build_coda(st, patch, slot_scale(patch, 2), nasal ? st->nasAmt.v : 0) : false;
     st->phase = nrows > 0 ? PHASE_ONSET : PHASE_VOWEL;
     st->t = 0.0;
     st->codaVeto = false;
@@ -1218,7 +1314,7 @@ void te_formant_restart(TaudEngine *e, TaudFormantState *st)
     if (st->patch == NULL) return;
     f = st->vFront; o = st->vOpen; r = st->vRound; own = st->ownVowel;
     sg = st->sg; sm = st->sm; due = st->sgDue;
-    te_formant_note_on(e, st, st->patch);
+    te_formant_note_on(e, st, st->patch, true);
     st->vFront = f; st->vOpen = o; st->vRound = r; st->ownVowel = own;
     st->sg = sg; st->sm = sm; st->sgDue = due;
     /* A chip source is re-keyed as Q re-keys an OPL note: the attack from
@@ -1230,7 +1326,7 @@ void te_formant_restart(TaudEngine *e, TaudFormantState *st)
 
 static void formant_glide_to(TaudFormantState *st, double open, double front, double round)
 {
-    double ms = (st->patch != NULL ? st->patch->glide : 0) * 2;
+    double ms = glide_ms_of(st);
     if (st->fresh || ms <= 0) {
         st->vOpen = open; st->vFront = front; st->vRound = round;
         st->glideLeft = 0.0;
@@ -1250,17 +1346,21 @@ void te_formant_relatch(TaudEngine *e, TaudFormantState *st, const TaudFormantPa
     formant_glide_to(st, patch->open, patch->front, patch->round);
     if (st->glideLeft > 0) { st->ownVowel = true; st->rejoin = true; }
     else { st->ownVowel = false; st->rejoin = false; }
+    /* The nasalisation and the r-colouring go with the vowel (item 292). */
+    amt_relatch(st, &st->nasAmt, patch->nasal);
+    amt_relatch(st, &st->rhoAmt, patch->rhotic);
     if (st->phase == PHASE_ONSET || st->phase == PHASE_VOWEL) {
-        st->hasCoda = build_coda(st, patch, slot_scale(patch, 2));
+        st->hasCoda = build_coda(st, patch, slot_scale(patch, 2), st->nasAmt.v);
     }
 }
 
 /* A sampled note handed a formant instrument mid-note: the tract starts at
  * the vowel — or a syllable with no vowel at its nucleus, holding — with the
  * coda ready. */
-void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch)
+void te_formant_start_at_vowel(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch, bool keep)
 {
-    te_formant_note_on(e, st, patch);
+    te_formant_note_on(e, st, patch, keep);
+    st->atVowel = true;
     st->sv = 0;
     if (st->phase == PHASE_CODA) return;   /* nothing to say */
     if (st->nucleus >= 0) {
@@ -1286,6 +1386,77 @@ void te_formant_set_vowel(TaudFormantState *st, int f, int g, int r)
     st->ownVowel = true;
     st->rejoin = false;
     formant_glide_to(st, (f & 15) * 17, (g & 15) * 17, (r & 15) * 17);
+}
+
+/* S $91xx: the note's glide time, re-timing what is under way. */
+static void formant_set_glide(TaudFormantState *st, int units)
+{
+    double ms = units * 2;
+    int i;
+    st->glideOv = units;
+    if (st->glideLeft > 0) {
+        if (ms <= 0) {
+            st->vOpen = st->tOpen; st->vFront = st->tFront; st->vRound = st->tRound;
+            st->glideLeft = 0.0;
+            if (st->rejoin) { st->ownVowel = false; st->rejoin = false; }
+        } else {
+            st->gOpen = (st->tOpen - st->vOpen) / ms;
+            st->gFront = (st->tFront - st->vFront) / ms;
+            st->gRound = (st->tRound - st->vRound) / ms;
+            st->glideLeft = ms;
+        }
+    }
+    for (i = 0; i < 2; i++) {
+        TaudFormantAmount *a = i == 0 ? &st->nasAmt : &st->rhoAmt;
+        if (a->left <= 0) continue;
+        if (ms <= 0) {
+            a->v = a->to; a->left = 0.0;
+            if (a->rejoin) { a->own = false; a->rejoin = false; }
+        } else {
+            a->step = (a->to - a->v) / ms;
+            a->left = ms;
+        }
+    }
+}
+
+/*
+ * S $9xxx, formant control (item 292), `arg` the low twelve bits:
+ *
+ *  - $0kx, x = 00nr — the vowel nasalised (n) and r-coloured (r), SET as
+ *    written, each gliding there over the note's glide time as the vowel does
+ *    (at once on the trigger row); k = 1 also moves into the coda now, as a
+ *    key-off would, without keying the voice off — and HOLDS its consonant
+ *    while the key is held; the key-off then lets it go.
+ *  - $1xx — the note's glide time, xx in 2 ms units: every glide still under
+ *    way covers what is left of it in the new time, and every later one
+ *    takes it. The trigger row's own glides are jumps whatever it says.
+ *
+ * Every other argument is RESERVED and does nothing. All of it is the NOTE's:
+ * the next trigger starts from the record again; Q's retrigger keeps it.
+ */
+void te_formant_command(TaudEngine *e, TaudFormantState *st, int arg)
+{
+    int sel;
+    bool was;
+    if (st->patch == NULL) return;
+    sel = (arg >> 8) & 0xf;
+    if (sel == 1) { formant_set_glide(st, arg & 0xff); return; }
+    if (sel != 0 || (arg & 0xec) != 0) return;
+    was = nasal_of(st, st->patch);
+    st->nasAmt.own = true; st->nasAmt.rejoin = false;
+    amt_glide_to(st, &st->nasAmt, (arg & 2) != 0 ? 1 : 0);
+    st->rhoAmt.own = true; st->rhoAmt.rejoin = false;
+    amt_glide_to(st, &st->rhoAmt, (arg & 1) != 0 ? 1 : 0);
+    /* On the trigger row the onset already heads for the vowel it will meet:
+     * a changed nasality builds the syllable again, its velum lowered or not. */
+    if (st->fresh && nasal_of(st, st->patch) != was && has_vowel(st->patch)) {
+        double f = st->vFront, o = st->vOpen, r = st->vRound;
+        bool own = st->ownVowel;
+        if (st->atVowel) te_formant_start_at_vowel(e, st, st->patch, true);
+        else te_formant_note_on(e, st, st->patch, true);
+        st->vFront = f; st->vOpen = o; st->vRound = r; st->ownVowel = own;
+    }
+    if ((arg & 0x10) != 0) st->codaCall = true;
 }
 
 static void start_noise(const TaudEngine *e, TaudFormantState *st, const TaudFormantSegment *seg)
@@ -1742,6 +1913,18 @@ static double onset_met_zero(const TaudFormantState *st, const TaudFormantSegmen
     return vz;
 }
 
+/* A held coda's time (codaHeldTime): at its hold point and no further — a
+ * trill's taken back a cycle at a time, so it goes on trilling. */
+static double coda_held_time(const TaudFormantSegment *seg, double t)
+{
+    if (t <= seg->hold) return t;
+    if (seg->loop > 0) {
+        while (t >= seg->hold) t -= seg->loop;
+        return t;
+    }
+    return seg->hold;
+}
+
 /* One control update (≈ 1 ms): the sequencer, the vowel, the coefficients. */
 static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *st)
 {
@@ -1752,11 +1935,15 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
     double *V = st->V, *VB = st->VB, *F = st->F, *B = st->B, *casc = st->casc;
     double ampNow[3], ampNext[3], nextF[5], nextB[5];
     const TaudFormantSegment *seg = NULL;
-    bool holding, sung, nasalV, nasality, steady;
+    bool holding, sung, nasalV, nasality, steady, codaHeld;
+    double ra, na;
     st->ctl = upd;
 
     /* A fade before the coda has started takes the coda away for good. */
     if (voice->noteFading && st->phase != PHASE_CODA) st->codaVeto = true;
+    /* A coda S $9010 called for HOLDS at its steady part while the key is
+     * held; the key-off lets it go on through its release (item 292). */
+    codaHeld = st->codaCall && !voice->keyOff;
     /* Walk past finished onset consonants into the vowel. A nucleus never
      * finishes: it holds, a trill's time wrapping back by its cycle. */
     while (st->phase == PHASE_ONSET && st->t >= st->onset[st->seg].end) {
@@ -1772,14 +1959,23 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
         else start_noise(e, st, &st->onset[st->seg]);
     }
     holding = st->phase == PHASE_ONSET && st->held;
-    if ((st->phase == PHASE_VOWEL || holding) && voice->keyOff && !st->codaVeto && st->hasCoda) {
+    /* A key-off speaks the coda — and so does S $9010 (item 292), with the key
+     * still held. */
+    if ((st->phase == PHASE_VOWEL || holding) && (voice->keyOff || st->codaCall) && !st->codaVeto &&
+        st->hasCoda) {
+        /* Leaving a vowel nasalised other than as the coda was built for
+         * (S $90kx, an instrument change gliding): the coda leaves it as it is. */
+        if (st->nucleus < 0 && st->nasAmt.v != st->codaZ0) {
+            st->hasCoda = build_coda(st, patch, slot_scale(patch, 2), st->nasAmt.v);
+        }
         st->phase = PHASE_CODA;
         st->t = 0.0;
         /* After a hissing nucleus the coda's own noise waits for the hiss to go. */
         st->codaNoise = st->coda.noiseAt <= 0;
         if (st->codaNoise) start_noise(e, st, &st->coda);
     }
-    if (st->phase == PHASE_CODA && st->t >= st->coda.end) {
+    /* (A coda that holds at its very end — silence — is over there as before.) */
+    if (st->phase == PHASE_CODA && st->t >= st->coda.end && !(codaHeld && st->coda.hold < st->coda.end)) {
         st->phase = PHASE_DONE;
         st->av = 0; st->avStep = 0; st->ah = 0; st->ahStep = 0; st->af = 0; st->afStep = 0;
         st->nOn = false;
@@ -1805,12 +2001,25 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
     } else if (!st->ownVowel) {
         st->vOpen = patch->open; st->vFront = patch->front; st->vRound = patch->round;
     }
+    amt_advance(&st->nasAmt, dt, patch->nasal);
+    amt_advance(&st->rhoAmt, dt, patch->rhotic);
     /* A syllable with no vowel still has the tongue's rest — the vowel bytes —
      * for what its consonants take from "the vowel's". */
     sung = st->nucleus < 0;
     f0 = voice_f0(e, voice);
     ref = note_hz(ref_note(patch));
-    s = vowel_at_pitch(e, st->vFront, st->vOpen, st->vRound, f0, ref, patch->track, V, VB, sung && patch->rhotic);
+    /* R-coloured part of the way (S $90kx gliding): between the plain vowel
+     * and the r-coloured one, in log frequency, as the glide G blends. */
+    ra = sung ? st->rhoAmt.v : 0;
+    s = vowel_at_pitch(e, st->vFront, st->vOpen, st->vRound, f0, ref, patch->track, V, VB, ra >= 1);
+    if (ra > 0 && ra < 1) {
+        double *VR = st->VR, *VRB = st->VRB;
+        vowel_at_pitch(e, st->vFront, st->vOpen, st->vRound, f0, ref, patch->track, VR, VRB, true);
+        for (n = 0; n < 5; n++) {
+            V[n] *= js_pow(VR[n] / V[n], ra);
+            VB[n] *= js_pow(VRB[n] / VB[n], ra);
+        }
+    }
     if (st->sv != 0) {
         double gw = track_at(&st->svW, st->svT);
         if (gw > 0) {
@@ -1828,13 +2037,18 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
     /* Nasalised, as Klatt makes it: F1 a hundred hertz higher (at a man's
      * size), the order kept, and the nasal zero midway between that F1 and
      * the nasal pole. */
-    nasalV = sung && patch->nasal;
+    /* Nasalised part of the way (S $90kx gliding), F1 rises part of its
+     * 100 Hz and the zero opens part of the way from the pole to its place. */
+    na = sung ? st->nasAmt.v : 0;
+    nasalV = na > 0;
     vz = fnp;
     if (nasalV) {
-        V[0] = dmin(V[0] + NASAL_F1 * s, ceil);
+        double mid;
+        V[0] = dmin(V[0] + NASAL_F1 * s * na, ceil);
         VB[0] = dmax(V[0] / 10, 50);
         for (n = 1; n < 5; n++) if (V[n] < V[n - 1] * 1.15) V[n] = dmin(V[n - 1] * 1.15, ceil);
-        vz = (V[0] + fnp) / 2;
+        mid = (V[0] + fnp) / 2;
+        vz = na >= 1 ? mid : fnp + na * (mid - fnp);
     }
     nasality = nasalV || (st->nucleus >= 0 && st->onset[st->nucleus].row->fnz > 0);
 
@@ -1873,7 +2087,7 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
             zf = seg_zero(seg->row, w, s, met, fnp, ceil);
         }
         seg_amps(seg, st->t, ampNow);
-        seg_amps(seg, st->t + dt, ampNext);
+        seg_amps(seg, codaHeld ? coda_held_time(seg, st->t + dt) : st->t + dt, ampNext);
     } else {
         bool gl = st->sv != 0;
         memcpy(F, V, 5 * sizeof *F);
@@ -1931,6 +2145,7 @@ static void formant_control(TaudEngine *e, TaudVoice *voice, TaudFormantState *s
     st->nvStep = (nvEnd - st->nv) * inv;
     st->fresh = false;
     if (st->phase != PHASE_VOWEL) st->t += dt;
+    if (st->phase == PHASE_CODA && codaHeld) st->t = coda_held_time(&st->coda, st->t);
     if (st->sv != 0 && st->phase != PHASE_ONSET) {
         st->svT += dt;
         if (st->svT >= st->svEnd) st->sv = 0;

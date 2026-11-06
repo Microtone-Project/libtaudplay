@@ -591,7 +591,7 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     if (inst->formant != NULL) {
         if (voice->formant == NULL) { voice->formant = &voice->formantStore; te_formant_state_init(voice->formant); }
         /* A lyric instrument's note sings the syllable its trigger chose. */
-        te_formant_note_on(e, voice->formant, lyricPatch != NULL ? lyricPatch : inst->formant);
+        te_formant_note_on(e, voice->formant, lyricPatch != NULL ? lyricPatch : inst->formant, false);
         te_formant_key_source(voice->formant, formantChip);
     } else {
         voice->formant = NULL;

@@ -62,6 +62,7 @@ check: all tests/compare tests/scenario tests/jsmath_check tests/wavcheck
 	FUZZ_INSTS=formant FUZZ_LYRIC=1 node tests/gen_fuzz.mjs $(JS) 7 tests/out/lyric.taud
 	JS=$(JS) sh tests/scenario.sh tests/out/lyric.taud 48000 1
 	FUZZ_INSTS=formant FUZZ_LYRIC=1 JS=$(JS) sh tests/fuzz.sh 1 4 8
+	FUZZ_INSTS=formant FUZZ_S9=1 JS=$(JS) sh tests/fuzz.sh 1 4 8
 
 clean:
 	rm -f $(OBJS) libtaudplay.a taudplay tests/compare tests/scenario tests/robust tests/jsmath_check tests/wavcheck

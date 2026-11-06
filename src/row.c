@@ -86,7 +86,7 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
     } else if (newInst->formant != NULL) {
         v->formant = &v->formantStore;
         te_formant_state_init(v->formant);
-        te_formant_start_at_vowel(e, v->formant, tract);
+        te_formant_start_at_vowel(e, v->formant, tract, false);
         te_formant_key_source(v->formant, formantChip);
     } else {
         v->formant = NULL;

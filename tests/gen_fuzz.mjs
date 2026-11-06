@@ -378,6 +378,12 @@ for (const idx of [...sampleInsts.slice(0, 10), oplInsts[0], psgInsts[0], forman
 }
 
 // ── patterns ──
+// S $9xxx, formant control: nasal/rhotic set (and the coda called), a glide
+// time (0 included), now and then a reserved argument.
+const s9Arg = () => pick([0x9000 | ri(0, 3), 0x9000 | ri(0, 3), 0x9010 | ri(0, 3), 0x9010 | ri(0, 3),
+  0x9100 | ri(0, 0xff), 0x9100 | ri(0, 20), 0x9100, 0x9000 | ri(0, 0xfff)]);
+// FUZZ_S9=1 makes it half of every effect column command, on far more rows.
+const denseS9 = process.env.FUZZ_S9 === "1";
 const EFFECTS = [
   [0x01, () => (pick([0, 1, 2, 4, 8, 12, 16, 20, 5, 9]) << 8)],
   [0x02, () => ri(0, 0xffff)], [0x03, () => ri(0, 0xffff)],
@@ -394,7 +400,10 @@ const EFFECTS = [
   [0x18, () => ri(0, 0x2000)], [0x19, () => ri(0, 255) << 8],
   [0x1a, () => ri(0, 255) << 8], [0x1b, () => ri(0, 0xffff)],
   [0x1c, () => {
-    const sub = pick([0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 0xa, 0xa, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf]);
+    const sub = pick([0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 9, 9, 9, 0xa, 0xa, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf]);
+    // S $9 on a formant voice: nasal/rhotic set (and the coda called), a glide
+    // time (0 included), now and then a reserved argument.
+    if (sub === 9) return s9Arg();
     // S $A on a PSG voice: an auto-advance, a level, the mutes.
     if (sub === 0xa && chance(0.5)) {
       return pick([0xa000 | ri(0, 0xff), 0xa100 | ri(0, 0x3f), 0xa800 | ri(0, 0xff), 0xa900 | ri(0, 0x3f),
@@ -555,8 +564,8 @@ function makePattern() {
     w16(p, o, note);
     p[o + 2] = inst;
     const volEff = chance(0.6) ? 0 : ri(1, 3);
-    const hasFx = chance(0.45);
-    const [op, argf] = hasFx ? pick(EFFECTS) : [0, () => 0];
+    const hasFx = chance(denseS9 ? 0.8 : 0.45);
+    const [op, argf] = !hasFx ? [0, () => 0] : denseS9 && chance(0.5) ? [0x1c, s9Arg] : pick(EFFECTS);
     const arg = hasFx ? argf() : 0;
     if (!wide) {
       p[o + 3] = (chance(0.5) ? ri(0, 63) : 0) | ((chance(0.5) ? 3 : volEff) << 6);
