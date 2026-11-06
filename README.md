@@ -1,5 +1,10 @@
 # taudplay-c
 
+---
+<p align="center"><em>You are currently looking at the C99 version.</em></p>
+<p align="center"><a href="https://github.com/Microtone-Project/microtone-taudplay">JavaScript</a> · C99 · <a href="https://github.com/Microtone-Project/taudplay-java">Java</a> · <a href="https://github.com/Microtone-Project/taudplay-godot">Godot 4</a> · <a href="https://github.com/Microtone-Project/taudplay-libgdx">LibGDX</a></p>
+---
+
 **Play `.taud` songs from C. No tracker, no browser, no dependencies.**
 
 A portable C99 port of [`taudplay`](https://github.com/curioustorvald/microtone-taudplay),
