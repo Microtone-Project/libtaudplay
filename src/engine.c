@@ -72,6 +72,10 @@ void te_voice_init(TaudVoice *v)
     v->envPitchValue = 0.5;
     v->envFilterValue = 0.5;
     v->fadeoutVolume = 1.0;
+    v->fadeoutMix = 1.0;
+    v->faderCur = NAN;
+    v->elevCur = NAN;
+    v->sfCents = NAN;
     v->activeChanCount = 1;
     v->right.nesDpcmCounter = 63;
     v->activeVolEnv = DEFAULT_ENV_3F;
@@ -578,7 +582,11 @@ void te_reset_play_state(TaudEngine *e)
     e->finePatternDelayExtra = 0;
     e->pendingInterrupts = 0;
     memset(e->interruptArgs, 0, sizeof e->interruptArgs);
-    for (i = 0; i < MAX_VOICES; i++) e->voices[i].active = false;
+    /* A play starts AT its levels: nothing glides in from the last one. */
+    for (i = 0; i < MAX_VOICES; i++) { e->voices[i].active = false; e->voices[i].faderCur = NAN; }
+    e->gvolGlide.cur = NAN;
+    e->mvolGlide.cur = NAN;
+    e->masterGlide.cur = NAN;
     e->bgCount = 0;
     if (e->mastering != NULL) te_master_chain_reset(e->mastering);
     /* …and the instruments' chains (item 217) for the same reason: a reverb
@@ -715,6 +723,11 @@ TaudEngine *te_engine_new(int rate)
     e->rampOutSamples = (int)js_round(RAMP_OUT_SEC * rate);
     e->volRampSamples = (int)js_round(VOL_RAMP_SEC * rate);
     e->attackRampSamples = (int)js_round(ATTACK_RAMP_SEC * rate);
+    e->sfFilterGlideSamples = (int)js_round(SF_FILTER_GLIDE_SEC * rate);
+    if (e->sfFilterGlideSamples < 1) e->sfFilterGlideSamples = 1;
+    e->gvolGlide.cur = NAN;
+    e->mvolGlide.cur = NAN;
+    e->masterGlide.cur = NAN;
     if (e->volRampSamples < 1) e->volRampSamples = 1;
     if (e->attackRampSamples < 1) e->attackRampSamples = 1;
     if (e->rampOutSamples < 1) e->rampOutSamples = 1;

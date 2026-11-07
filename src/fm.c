@@ -110,11 +110,12 @@ static double fm_eval_operator(TaudEngine *e, TaudFmRig *rig, int k, int interpM
     if (k != 0) {
         double effEnvVol;
         s = te_apply_voice_filter_self(v, s);
+        te_advance_filter_glide(e, v);
         v->envVolMix += v->envVolStep;
         effEnvVol = v->hasVolEnv && v->volEnvOn ? v->envVolMix : 1.0;
         te_advance_volume_ramp(e, v, e->volDiv);
         te_advance_pitch_ramp(e, v, spt);
-        g *= effEnvVol * v->fadeoutVolume * v->activeAttenGain * (inst->instGlobalVolume / 255.0);
+        g *= effEnvVol * te_advance_fadeout(v) * v->activeAttenGain * (inst->instGlobalVolume / 255.0);
         if (v->rampOutSamples > 0) {
             g *= v->rampOutGain;
             v->rampOutGain -= v->rampOutStep;

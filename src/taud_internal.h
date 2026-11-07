@@ -42,6 +42,9 @@
 #define FAST_FADE_SEC 0.3
 #define VOL_RAMP_SEC 0.002
 #define ATTACK_RAMP_SEC (32.0 / 48000.0)
+/* SoundFont-mode filter glide (item 297): FluidSynth's FLUID_BUFSIZE, 64
+ * samples at its default 44.1 kHz, carried as a time. */
+#define SF_FILTER_GLIDE_SEC (64.0 / 44100.0)
 #define PITCH_GLIDE_FULL_RATIO 0.014545334937523746
 
 #define SAMPLE_BIN_TOTAL 8388608
@@ -783,6 +786,12 @@ struct TaudVoice {
     double envFilterTimeSec, envFilterValue;
 
     double fadeoutVolume;
+    /* fadeoutVolume as the mixer glides it across the tick (advanceFadeout). */
+    double fadeoutMix, fadeoutMixStep;
+    /* The lane fader and the elevation as the mixer glides them
+     * (te_advance_fader_ramp / te_advance_elev_ramp); NaN = snap next sample. */
+    double faderCur, faderStep; int faderAim, faderLeft;
+    double elevCur, elevAim, elevStep; int elevLeft;
     int rampOutSamples;
     double rampOutGain, rampOutStep;
     int attackRampSamples;
@@ -818,6 +827,11 @@ struct TaudVoice {
     bool filterIsBiquad;
     double filterBqB02, filterBqB1, filterBqA1, filterBqA2, filterX1, filterX2;
     int filterCutoffCached, filterResonanceCached;
+    /* SoundFont-mode filter glide (te_advance_filter_glide): cutoff in cents
+     * and Q where they stand, per-sample steps, samples left, the refresh's
+     * targets. sfCents NaN = the next refresh lands at once. */
+    double sfCents, sfCentsIncr, sfHzAim, sfQ, sfQIncr, sfQAim;
+    int sfCentsLeft, sfCentsAim, sfQLeft;
 
     int randomVolBias, randomPanBias;
 
@@ -1201,10 +1215,17 @@ typedef struct TaudVoiceChunk {
     TaudVoice voices[1];        /* over-allocated */
 } TaudVoiceChunk;
 
+/* A level the host or the song sets outright, walked to its new value over the
+ * volume ramp (sampler.js ByteGlide); byte units, cur NaN = snap. */
+typedef struct {
+    double cur, aim, step;
+    int left;
+} TaudByteGlide;
+
 typedef struct TaudEngine {
     /* Rate-derived configuration (setSamplingRate). */
     int rate;
-    int rampOutSamples, volRampSamples, attackRampSamples;
+    int rampOutSamples, volRampSamples, attackRampSamples, sfFilterGlideSamples;
     double a500B1, a500A0, ledA1, ledA2, ledB1, ledB2;
 
     /* The sample pool, BORROWED from the parsed document and trimmed to its
@@ -1302,6 +1323,10 @@ typedef struct TaudEngine {
     /* The frame accumulators the buses join (mixAccL/R): a span's frames are
      * finished only once every bus has run over it. */
     double accL[TRACKER_CHUNK], accR[TRACKER_CHUNK];
+    /* The song's global, mixing and master volumes as the mixer glides them
+     * (TaudByteGlide), and each frame's combined gain, which the buses read. */
+    TaudByteGlide gvolGlide, mvolGlide, masterGlide;
+    double gainSpan[TRACKER_CHUNK];
 
     bool oom;                   /* an allocation failed on the render path */
 } TaudEngine;
@@ -1476,6 +1501,10 @@ void te_start_fast_fade(TaudEngine *e, TaudVoice *v);
 void te_advance_pitch_ramp(TaudEngine *e, TaudVoice *v, double spt);
 double te_advance_pan_ramp(TaudEngine *e, TaudVoice *v, double target, bool wrap);
 void te_advance_volume_ramp(TaudEngine *e, TaudVoice *v, double div);
+double te_advance_fadeout(TaudVoice *v);
+double te_byte_glide_next(const TaudEngine *e, TaudByteGlide *g, int target);
+double te_advance_fader_ramp(const TaudEngine *e, TaudVoice *v, int target);
+double te_advance_elev_ramp(const TaudEngine *e, TaudVoice *v, double target);
 
 /* envelope.c */
 void te_apply_key_lift(TaudVoice *v, const TaudInst *inst);
@@ -1492,6 +1521,7 @@ static inline bool te_env_carry(int loopWord) { return ((loopWord >> 6) & 1) != 
 void te_refresh_voice_filter(const TaudEngine *e, TaudVoice *v);
 double te_apply_voice_filter(const TaudVoice *v, double x0, TaudChannelState *st);
 double te_apply_voice_filter_self(TaudVoice *v, double x0);
+void te_advance_filter_glide(const TaudEngine *e, TaudVoice *v);
 double te_apply_taud_voice_fx(const TaudVoice *v, double sample, int *bitcrusherCounter, double *bitcrusherHeld);
 
 /* fm.c */

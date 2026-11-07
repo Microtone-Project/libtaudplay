@@ -23,6 +23,7 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
         out[1] = s;
+        te_advance_filter_glide(e, v);
         return;
     }
     /* An OPL channel (item 209) replaces the sample fetch, reading the chip
@@ -33,6 +34,7 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
         out[1] = s;
+        te_advance_filter_glide(e, v);
         return;
     }
     /* A PSG pair (§7.9) on the same chip clock. Unlike OPL it leaves the note
@@ -44,6 +46,7 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
         out[1] = s;
+        te_advance_filter_glide(e, v);
         return;
     }
     /* A formant voice (item 212) plays its sample — or the chip channel it is
@@ -54,6 +57,7 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
         out[1] = s;
+        te_advance_filter_glide(e, v);
         return;
     }
     if (v->activeChanCount != 2) {
@@ -62,6 +66,7 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
         s = te_apply_taud_voice_fx(v, s, &v->bitcrusherCounter, &v->bitcrusherHeld);
         out[0] = s;
         out[1] = s;
+        te_advance_filter_glide(e, v);
         return;
     }
     te_fetch_tracker_sample_stereo(e, v, inst, interpMode, out);
@@ -75,6 +80,8 @@ static void render_voice_pair(TaudEngine *e, TaudVoice *v, TaudInst *inst, int i
     out[0] = te_apply_taud_voice_fx(v, te_apply_voice_filter_self(v, c0), &v->bitcrusherCounter, &v->bitcrusherHeld);
     out[1] = te_apply_taud_voice_fx(v, te_apply_voice_filter(v, c1, &v->right),
                                     &v->right.bitcrusherCounter, &v->right.bitcrusherHeld);
+    /* Once per frame, after both channels: they share the coefficients. */
+    te_advance_filter_glide(e, v);
 }
 
 /* ── pcm32fToPcm8: noise-shaped TPDF dither, binary32 at every step ── */
@@ -140,8 +147,9 @@ static inline double attack_gain(const TaudEngine *e, int attackRampSamples)
  * the song's global gain, in ascending slot order (runImixBuses). A bus whose
  * chain is idle and was not fed is skipped outright. Each bus is then left
  * clear for the next span. */
-static void run_imix_buses(TaudEngine *e, int n0, int n1, double globalGain)
+static void run_imix_buses(TaudEngine *e, int n0, int n1)
 {
+    const double *gainSpan = e->gainSpan;
     TaudSpatialBus *spatial = e->spatial;
     int b, k, n, c;
     for (b = 0; b < e->imixCount; b++) {
@@ -160,13 +168,13 @@ static void run_imix_buses(TaudEngine *e, int n0, int n1, double globalGain)
             te_imx_chain_process(chain, d, TRACKER_CHUNK, n0, n1, e->bpm, bus->fed);
             if (spatial == NULL) {
                 for (n = n0; n < n1; n++) {
-                    e->accL[n] += d[n] * globalGain;
-                    e->accR[n] += d[TRACKER_CHUNK + n] * globalGain;
+                    e->accL[n] += d[n] * gainSpan[n];
+                    e->accR[n] += d[TRACKER_CHUNK + n] * gainSpan[n];
                 }
             } else {
                 for (c = 0; c < bus->nch; c++) {
                     int o = c * TRACKER_CHUNK;
-                    for (n = n0; n < n1; n++) spatial->data[o + n] += d[o + n] * globalGain;
+                    for (n = n0; n < n1; n++) spatial->data[o + n] += d[o + n] * gainSpan[n];
                 }
             }
         }
@@ -183,11 +191,7 @@ static void finish_span(TaudEngine *e, int n0, int n1)
 {
     TaudSpatialBus *spatial = e->spatial;
     int n;
-    if (e->imixCount > 0) {
-        double gvol = e->globalVolume / 255.0;
-        double mvol = e->mixingVolume / 255.0;
-        run_imix_buses(e, n0, n1, (gvol * mvol * e->masterVolume) / 255.0);
-    }
+    if (e->imixCount > 0) run_imix_buses(e, n0, n1);
     for (n = n0; n < n1; n++) {
         double mixL, mixR;
         if (spatial != NULL) {
@@ -255,7 +259,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
 
     for (n = 0; n < TRACKER_CHUNK; n++) {
         double spt = (srate * 2.5) / e->bpm;
-        double gvol, mvol, globalGain;
+        double gvol, mvol, master, globalGain;
 
         /* A tick about to fire ends the span before it. */
         if (n > n0 && e->samplesIntoTick + 1.0 >= spt) {
@@ -292,9 +296,13 @@ bool te_generate_tracker_audio(TaudEngine *e)
             while (e->psgQuarter < q) { e->psgQuarter++; te_psg_quarter_pass(e); }
         }
 
-        gvol = e->globalVolume / 255.0;
-        mvol = e->mixingVolume / 255.0;
-        globalGain = (gvol * mvol * e->masterVolume) / 255.0;
+        /* The song-level gains glide to a new value over the volume ramp
+         * (ByteGlide); held still they are the very numbers they always were. */
+        gvol = te_byte_glide_next(e, &e->gvolGlide, e->globalVolume) / 255.0;
+        mvol = te_byte_glide_next(e, &e->mvolGlide, e->mixingVolume) / 255.0;
+        master = te_byte_glide_next(e, &e->masterGlide, e->masterVolume) / 1.0;
+        globalGain = (gvol * mvol * master) / 255.0;
+        e->gainSpan[n] = globalGain;
         e->accL[n] = 0.0;
         e->accR[n] = 0.0;
 
@@ -302,9 +310,15 @@ bool te_generate_tracker_audio(TaudEngine *e)
             TaudVoice *voice = &e->voices[vi];
             TaudInst *inst;
             TaudImixBus *route;
-            double pair[2], sL, sR, instGv, swingScale, effEnvVol, faderGain, perVoiceGain, vol;
+            double pair[2], sL, sR, instGv, swingScale, effEnvVol, fade, faderGain, perVoiceGain, vol;
             double lGain = 0.0, rGain = 0.0, rampGain;
-            if (!voice->active || voice->fader == 255) continue;
+            if (!voice->active || isnan(voice->faderCur)) {
+                /* Nothing sounding (or nothing glided yet): the fader is
+                 * where the host put it. */
+                voice->faderCur = voice->fader; voice->faderAim = voice->fader; voice->faderLeft = 0;
+            }
+            /* Muted, and the fader's glide down has finished: frozen. */
+            if (!voice->active || (voice->fader == 255 && voice->faderCur == 255)) continue;
             inst = &e->instruments[voice->instrumentId];
             te_advance_sample_mod_extended(e, voice, spt);
             render_voice_pair(e, voice, inst, e->interpolationMode, spt, pair, n);
@@ -316,11 +330,12 @@ bool te_generate_tracker_audio(TaudEngine *e)
             effEnvVol = voice->hasVolEnv && voice->volEnvOn ? voice->envVolMix : 1.0;
             te_advance_volume_ramp(e, voice, e->volDiv);
             te_advance_pitch_ramp(e, voice, spt);
-            faderGain = (255 - voice->fader) / 255.0;
+            fade = te_advance_fadeout(voice);
+            faderGain = (255 - te_advance_fader_ramp(e, voice, voice->fader)) / 255.0;
             /* An OPL voice took its note volume into the operators — unless the
              * chip is operator 0 of a rack, which reads it at unity and leaves
              * the note's volume to the finished patch (§5.5.1). */
-            perVoiceGain = effEnvVol * voice->fadeoutVolume *
+            perVoiceGain = effEnvVol * fade *
                 (voice->opl != NULL && voice->fmRig == NULL ? 1.0 : voice->currentMixVolume) *
                 swingScale * instGv * faderGain * voice->layerMixGain * voice->activeAttenGain;
             vol = perVoiceGain * globalGain;
@@ -335,6 +350,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 rGain = voice->panLawR;
             } else {
                 te_advance_pan_ramp(e, voice, te_voice_azimuth(voice), true);
+                te_advance_elev_ramp(e, voice, te_voice_elevation(voice));
             }
             if (voice->rampOutSamples > 0) {
                 rampGain = voice->rampOutGain;
@@ -381,12 +397,14 @@ bool te_generate_tracker_audio(TaudEngine *e)
             TaudInst *inst;
             TaudImixBus *route;
             int bgFader;
-            double pair[2], sL, sR, instGv, swingScale, effEnvVol, faderGain, vol;
+            double pair[2], sL, sR, instGv, swingScale, effEnvVol, fade, faderGain, vol;
             double lGain = 0.0, rGain = 0.0, rampGain;
             if (bg->fmOperator) continue;
             srcVoice = bg->sourceChannel >= 0 && bg->sourceChannel < MAX_VOICES ? &e->voices[bg->sourceChannel] : NULL;
             bgFader = srcVoice != NULL && srcVoice->fader > bg->fader ? srcVoice->fader : bg->fader;
-            if (!bg->active || bgFader == 255) continue;
+            if (!bg->active) continue;
+            if (isnan(bg->faderCur)) { bg->faderCur = bgFader; bg->faderAim = bgFader; bg->faderLeft = 0; }
+            if (bgFader == 255 && bg->faderCur == 255) continue; /* muted, glide finished */
             inst = &e->instruments[bg->instrumentId];
             if (bg->isLayerChild) te_advance_sample_mod_extended(e, bg, spt);
             render_voice_pair(e, bg, inst, e->interpolationMode, spt, pair, n);
@@ -398,11 +416,12 @@ bool te_generate_tracker_audio(TaudEngine *e)
             effEnvVol = bg->hasVolEnv && bg->volEnvOn ? bg->envVolMix : 1.0;
             te_advance_volume_ramp(e, bg, e->volDiv);
             te_advance_pitch_ramp(e, bg, spt);
-            faderGain = (255 - bgFader) / 255.0;
-            vol = (effEnvVol * bg->fadeoutVolume *
+            fade = te_advance_fadeout(bg);
+            faderGain = (255 - te_advance_fader_ramp(e, bg, bgFader)) / 255.0;
+            vol = (effEnvVol * fade *
                    (bg->opl != NULL && bg->fmRig == NULL ? 1.0 : bg->currentMixVolume) *
                    swingScale * gvol * mvol * instGv * faderGain * bg->layerMixGain * bg->activeAttenGain *
-                   e->masterVolume) / 255.0;
+                   master) / 255.0;
             if (spatial == NULL) {
                 double pan = te_advance_pan_ramp(e, bg, te_voice_pan_byte(bg), false);
                 if (pan != bg->panLawPan) {
@@ -414,6 +433,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 rGain = bg->panLawR;
             } else {
                 te_advance_pan_ramp(e, bg, te_voice_azimuth(bg), true);
+                te_advance_elev_ramp(e, bg, te_voice_elevation(bg));
             }
             if (bg->rampOutSamples > 0) {
                 rampGain = bg->rampOutGain;
@@ -430,7 +450,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             route = voice_route(e, bg);
             if (route != NULL) {
                 /* The same chain without the three song-level gains the bus is ahead of. */
-                double bvol = effEnvVol * bg->fadeoutVolume *
+                double bvol = effEnvVol * fade *
                     (bg->opl != NULL && bg->fmRig == NULL ? 1.0 : bg->currentMixVolume) *
                     swingScale * instGv * faderGain * bg->layerMixGain * bg->activeAttenGain;
                 route->fed = true;

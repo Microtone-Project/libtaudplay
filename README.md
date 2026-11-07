@@ -299,8 +299,10 @@ where it has the flag, see [Numerics](#numerics)) runs:
   `FUZZ_IMIX=0` in none, and `FUZZ_IMIX_KINDS=tsh1,expd` (any FourCCs) draws
   their equipment from those pieces alone.
   `FUZZ_LYRIC=1` gives every song lyrics, `FUZZ_LYRIC=0` none.
-  `FUZZ_S9=1` makes `S $9xxx` half of every effect command, on most rows.
-  `FUZZ_INSTS=opl`, `psg`, `formant` or `fm` narrows the patterns to one kind;
+  `FUZZ_S9=1` makes `S $9xxx` half of every effect command, on most rows;
+  `FUZZ_CUTS=1` does the same for `S $70`…`S $76` (past-note actions, New Note
+  Action overrides), best with `FUZZ_INSTS=layered`.
+  `FUZZ_INSTS=opl`, `psg`, `formant`, `fm` or `layered` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
 At the time of writing all of it is bit-identical against Node 26 (V8 14.6):
@@ -327,7 +329,7 @@ in spans between ticks; this one runs a frame at a time and finishes each span
 — the instrument buses, the fold-down, the Amiga filters — just before the
 tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 4.7.4 (Microtone.js 4.7.4, engine e583deb19b9a). The
+In step with taudplay 4.8.1 (Microtone.js 4.8.1, engine af37ee7d12dc). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

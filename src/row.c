@@ -97,6 +97,8 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
     v->keyOff = false;
     v->noteFading = false;
     v->fadeoutVolume = 1.0;
+    v->fadeoutMix = 1.0;
+    v->fadeoutMixStep = 0.0;
     if (!reAttack) return;
     if (!(mayCarry && te_env_carry(v->activeVolEnvLoop))) {
         v->envIndex = 0;

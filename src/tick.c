@@ -111,6 +111,8 @@ static void restart_voice(TaudEngine *e, TaudVoice *v)
         v->envFilterValue = 0.5; v->envFilterIndex = 0; v->envFilterTimeSec = 0.0;
     }
     v->fadeoutVolume = 1.0;
+    v->fadeoutMix = 1.0;
+    v->fadeoutMixStep = 0.0;
     v->autoVibPhase = 0;
     v->autoVibTicksSinceTrigger = 0;
     v->filterY1 = 0.0; v->filterY2 = 0.0; v->filterX1 = 0.0; v->filterX2 = 0.0;
@@ -602,13 +604,16 @@ void te_apply_tracker_tick(TaudEngine *e)
         update_filter_cutoff(voice);
         te_refresh_voice_filter(e, voice);
 
+        /* The mixer glides fadeoutMix to the new value across the tick, so
+         * the voice ends on the tick AFTER the multiplier reaches 0. */
         if (voice->keyOff || voice->noteFading) {
             int fadeStep = voice->activeFadeoutStep;
             if (fadeStep > 0) {
-                voice->fadeoutVolume = dmax(voice->fadeoutVolume - fadeStep / 1024.0, 0.0);
                 if (voice->fadeoutVolume <= 0.0) voice->active = false;
+                else voice->fadeoutVolume = dmax(voice->fadeoutVolume - fadeStep / 1024.0, 0.0);
             }
         }
+        voice->fadeoutMixStep = spt > 0.0 ? (voice->fadeoutVolume - voice->fadeoutMix) / spt : 0.0;
 
         te_advance_envelope(e, voice, tickSec);
         voice->envVolStep = spt > 0.0 ? (voice->envVolume - voice->envVolMix) / spt : 0.0;
@@ -685,6 +690,7 @@ void te_apply_tracker_tick(TaudEngine *e)
     for (i = e->bgCount - 1; i >= 0; i--) {
         TaudVoice *bg = e->bg[i];
         int autoVibDelta, finalPitch;
+        bool fadedOut;
         if (!bg->active) { te_bg_remove_at(e, i); continue; }
         if (bg->isLayerChild) {
             TaudVoice *parent = bg->fmOperator
@@ -741,17 +747,20 @@ void te_apply_tracker_tick(TaudEngine *e)
         bg->envVolStep = spt > 0.0 ? (bg->envVolume - bg->envVolMix) / spt : 0.0;
         te_advance_pitch_envelope(bg, tickSec);
         te_advance_filter_envelope(bg, tickSec);
+        /* Faded out on an EARLIER tick: its glide to silence is done. */
+        fadedOut = (bg->keyOff || bg->noteFading) && bg->fadeoutVolume <= 0.0;
         if (bg->keyOff || bg->noteFading) {
             int fadeStep = bg->activeFadeoutStep;
             if (fadeStep > 0) bg->fadeoutVolume = dmax(bg->fadeoutVolume - fadeStep / 1024.0, 0.0);
         }
+        bg->fadeoutMixStep = spt > 0.0 ? (bg->fadeoutVolume - bg->fadeoutMix) / spt : 0.0;
         autoVibDelta = te_advance_auto_vibrato(e, bg);
         finalPitch = iclamp(bg->noteVal + bg->layerPitchMod + autoVibDelta + pitch_env_delta(bg), 0x20, 0xffff);
         bg->playbackRate = te_compute_playback_rate(e, bg, finalPitch, e->tuningRatio);
         bg->renderPitch = finalPitch;
         update_filter_cutoff(bg);
         te_refresh_voice_filter(e, bg);
-        if ((bg->keyOff || bg->noteFading) && bg->fadeoutVolume <= 0.0) {
+        if (fadedOut) {
             bg->active = false;
             te_bg_remove_at(e, i);
         }

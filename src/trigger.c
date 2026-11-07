@@ -141,28 +141,70 @@ int te_row_volume_from_default(const TaudInst *inst, const TaudPatch *patch, int
     return volMax == 0xff ? dnv : (dnv * 63 + 127) / 255;
 }
 
+/* Drop bg[idx] on the spot — and, for a ghosted rack, its operands too. */
+static void drop_background_voice(TaudEngine *e, int idx)
+{
+    TaudVoice *culled = e->bg[idx];
+    int i;
+    culled->active = false;
+    te_bg_remove_at(e, idx);
+    if (culled->fmRig != NULL) {
+        for (i = e->bgCount - 1; i >= 0; i--) {
+            TaudVoice *bg = e->bg[i];
+            if (!bg->fmOperator || bg->fmParent != culled) continue;
+            bg->active = false;
+            bg->fmOperator = false;
+            bg->fmParent = NULL;
+            bg->isLayerChild = false;
+            te_bg_remove_at(e, i);
+        }
+    }
+}
+
+/* Already on its way out: no longer counts towards the cap. */
+static inline bool bg_leaving(const TaudVoice *v)
+{
+    return !v->active || v->rampOutSamples > 0 ||
+        (v->fmOperator && v->fmParent != NULL && v->fmParent->rampOutSamples > 0);
+}
+
+/* Cap the pool at MAX_BG_VOICES SOUNDING voices (trigger.js
+ * capBackgroundVoices): the evicted voice is ramped out, not dropped; a hard
+ * drop only past twice the cap. */
 void te_cap_background_voices(TaudEngine *e)
 {
-    while (e->bgCount > MAX_BG_VOICES) {
-        int idx = -1, i;
+    int live = 0, i;
+    for (i = 0; i < e->bgCount; i++) if (!bg_leaving(e->bg[i])) live++;
+    while (live > MAX_BG_VOICES) {
+        int idx = -1;
         TaudVoice *culled;
+        for (i = 0; i < e->bgCount; i++) {
+            const TaudVoice *v = e->bg[i];
+            if (!bg_leaving(v) && !v->isLayerChild && !v->fmOperator) { idx = i; break; }
+        }
+        if (idx < 0) for (i = 0; i < e->bgCount; i++) if (!bg_leaving(e->bg[i]) && !e->bg[i]->fmOperator) { idx = i; break; }
+        if (idx < 0) for (i = 0; i < e->bgCount; i++) if (!bg_leaving(e->bg[i])) { idx = i; break; }
+        culled = e->bg[idx];
+        if (culled->fmOperator) {
+            drop_background_voice(e, idx);
+            live--;
+            continue;
+        }
+        te_start_cut_ramp(e, culled);
+        live--;
+        if (culled->fmRig != NULL) {
+            for (i = 0; i < e->bgCount; i++) {
+                const TaudVoice *bg = e->bg[i];
+                if (bg->fmOperator && bg->fmParent == culled && bg->active) live--;
+            }
+        }
+    }
+    while (e->bgCount > 2 * MAX_BG_VOICES) {
+        int idx = -1;
         for (i = 0; i < e->bgCount; i++) if (!e->bg[i]->isLayerChild && !e->bg[i]->fmOperator) { idx = i; break; }
         if (idx < 0) for (i = 0; i < e->bgCount; i++) if (!e->bg[i]->fmOperator) { idx = i; break; }
         if (idx < 0) idx = 0;
-        culled = e->bg[idx];
-        culled->active = false;
-        te_bg_remove_at(e, idx);
-        if (culled->fmRig != NULL) {
-            for (i = e->bgCount - 1; i >= 0; i--) {
-                TaudVoice *bg = e->bg[i];
-                if (!bg->fmOperator || bg->fmParent != culled) continue;
-                bg->active = false;
-                bg->fmOperator = false;
-                bg->fmParent = NULL;
-                bg->isLayerChild = false;
-                te_bg_remove_at(e, i);
-            }
-        }
+        drop_background_voice(e, idx);
     }
 }
 
@@ -182,7 +224,7 @@ static void release_layer_children(TaudEngine *e, int vi)
         case 4:
             if (!bg->keyOff) { bg->keyOff = true; te_apply_key_lift(bg, &e->instruments[bg->instrumentId]); }
             break;
-        case 1: bg->active = false; break;
+        case 1: te_start_cut_ramp(e, bg); break; /* ramped out, as layer 0's ghost is */
         case 3: bg->noteFading = true; break;
         default: break;
         }
@@ -496,6 +538,8 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
             voice->activeFilterEnvSustain, &voice->envFilterIndex, &voice->envFilterTimeSec);
     }
     voice->fadeoutVolume = 1.0;
+    voice->fadeoutMix = 1.0;
+    voice->fadeoutMixStep = 0.0;
     voice->rampOutSamples = 0;
     voice->rampOutGain = 0.0;
     /* Not on an OPL or PSG voice: its attack IS the chip's envelope. */
@@ -547,6 +591,7 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     voice->filterY1 = 0.0; voice->filterY2 = 0.0; voice->filterX1 = 0.0; voice->filterX2 = 0.0;
     voice->filterCutoffCached = -1;
     voice->filterResonanceCached = -1;
+    voice->sfCents = NAN; voice->sfCentsLeft = 0; voice->sfQLeft = 0; /* a new note's filter lands at once */
     voice->noteVal = noteVal;
     voice->basePitch = noteVal;
     voice->renderPitch = noteVal;
@@ -561,6 +606,10 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     voice->volRampStep = 0.0;
     voice->snapPlaybackRate = true;
     voice->snapPan = true;
+    /* …and at its lane's fader and elevation: a fresh note has no waveform
+     * for a jump to click in. */
+    voice->elevCur = NAN;
+    voice->faderCur = NAN;
     voice->noteWasCut = false;
     voice->noteFading = false;
     voice->nnaOverride = -1;
@@ -622,9 +671,10 @@ static bool is_duplicate(TaudEngine *e, const TaudVoice *v, const DupKey *k, boo
 {
     const TaudInst *existInst = &e->instruments[v->instrumentId];
     const TaudInst *newInst = &e->instruments[k->newInstId];
-    /* A formant voice already into its coda, or ramping out, is no duplicate:
-     * what the check ends is the VOWEL. */
-    if (v->formant != NULL && (v->formant->phase >= PHASE_CODA || v->rampOutSamples > 0)) return false;
+    /* A voice already ramping out is already gone; a formant voice already
+     * into its coda is no duplicate: what the check ends is the VOWEL. */
+    if (v->rampOutSamples > 0) return false;
+    if (v->formant != NULL && v->formant->phase >= PHASE_CODA) return false;
     if (bare && inst_dup_check_type(existInst) != DCT_LANE) return false;
     switch (inst_dup_check_type(existInst)) {
     case 1: return v->noteVal == k->newNote && v->instrumentId == k->newInstId;
@@ -648,16 +698,15 @@ static void apply_dup_action(TaudEngine *e, TaudVoice *v, bool isFg, int channel
 {
     const TaudInst *existInst = &e->instruments[v->instrumentId];
     switch (inst_dup_check_action(existInst)) {
-    case 0:
-        if (v->formant != NULL) {
-            /* Ramped out over the incoming note's attack: the foreground voice
-             * through a ghost, since the note is about to reuse it. */
-            TaudVoice *r = isFg ? ghost_rig(e, v, channel) : v;
-            if (r != NULL) te_start_cut_ramp(e, r);
-            if (isFg) { v->active = false; te_cap_background_voices(e); }
-            break;
-        }
-        v->fadeoutVolume = 0.0; v->active = false; break;
+    case 0: {
+        /* Ramped out over the incoming note's attack — the foreground voice
+         * through a ghost, since the note is about to reuse it — as a New
+         * Note Action's cut is. */
+        TaudVoice *r = isFg ? ghost_rig(e, v, channel) : v;
+        if (r != NULL) te_start_cut_ramp(e, r);
+        if (isFg) { v->active = false; te_cap_background_voices(e); }
+        break;
+    }
     case 1: v->keyOff = true; te_apply_key_lift(v, existInst); break;
     case 2: v->noteFading = true; break;
     default: break;
@@ -704,6 +753,10 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
     if (v == NULL) return NULL;
     v->active = true;
     v->fader = src->fader;
+    v->faderCur = src->faderCur; v->faderAim = src->faderAim;
+    v->faderStep = src->faderStep; v->faderLeft = src->faderLeft;
+    v->elevCur = src->elevCur; v->elevAim = src->elevAim;
+    v->elevStep = src->elevStep; v->elevLeft = src->elevLeft;
     v->instrumentId = src->instrumentId;
     v->displayInst = src->displayInst;
     v->samplePos = src->samplePos;
@@ -746,6 +799,8 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
     v->envFilterTimeSec = src->envFilterTimeSec;
     v->envFilterValue = src->envFilterValue;
     v->fadeoutVolume = src->fadeoutVolume;
+    v->fadeoutMix = src->fadeoutMix;
+    v->fadeoutMixStep = src->fadeoutMixStep;
     v->autoVibPhase = src->autoVibPhase;
     v->autoVibTicksSinceTrigger = src->autoVibTicksSinceTrigger;
     v->currentCutoff = src->currentCutoff;
@@ -766,6 +821,9 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
     v->filterX2 = src->filterX2;
     v->filterCutoffCached = src->filterCutoffCached;
     v->filterResonanceCached = src->filterResonanceCached;
+    v->sfCents = src->sfCents; v->sfCentsIncr = src->sfCentsIncr; v->sfCentsLeft = src->sfCentsLeft;
+    v->sfCentsAim = src->sfCentsAim; v->sfHzAim = src->sfHzAim; v->sfQ = src->sfQ;
+    v->sfQIncr = src->sfQIncr; v->sfQLeft = src->sfQLeft; v->sfQAim = src->sfQAim;
     v->randomVolBias = src->randomVolBias;
     v->randomPanBias = src->randomPanBias;
     v->panbrelloOffset = src->panbrelloOffset;
@@ -955,8 +1013,10 @@ void te_apply_past_note_action(TaudEngine *e, int channel, int action)
     int i;
     switch (action) {
     case 0:
-        for (i = e->bgCount - 1; i >= 0; i--) {
-            if (e->bg[i]->sourceChannel == channel) te_bg_remove_at(e, i);
+        /* Ramped out, as every cut is; an FM operand ends with its carrier. */
+        for (i = 0; i < e->bgCount; i++) {
+            TaudVoice *bg = e->bg[i];
+            if (bg->sourceChannel == channel && !bg->fmOperator) te_start_cut_ramp(e, bg);
         }
         break;
     case 1:

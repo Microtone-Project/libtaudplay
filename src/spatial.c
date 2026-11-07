@@ -289,7 +289,7 @@ bool te_is_sounding_child(const TaudEngine *e, const TaudVoice *bg, int vi)
 static double display_weight(const TaudVoice *v)
 {
     double env = v->hasVolEnv && v->volEnvOn ? v->envVolMix : 1.0;
-    return env * v->fadeoutVolume * v->currentMixVolume * v->layerMixGain * ((255 - v->fader) / 255.0);
+    return env * v->fadeoutMix * v->currentMixVolume * v->layerMixGain * ((255 - v->fader) / 255.0);
 }
 
 /* The stereo pan the meters show for lane `vi`: the mix-weighted mean of the
@@ -322,7 +322,8 @@ const double *te_spatial_voice_gains(TaudEngine *e, TaudVoice *v)
     int nc = bus->numChannels;
     int chans = v->activeChanCount == 2 ? 2 : 1;
     double az = v->currentPan;
-    double el = te_voice_elevation(v);
+    /* …and the ramped elevation (te_advance_elev_ramp), for the same reason. */
+    double el = isnan(v->elevCur) ? te_voice_elevation(v) : v->elevCur;
     if (!sc->valid || sc->az != az || sc->el != el || sc->chans != chans || sc->rendererGen != e->rendererGen) {
         int k;
         for (k = 0; k < chans; k++) {

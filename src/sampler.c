@@ -457,3 +457,68 @@ void te_advance_volume_ramp(TaudEngine *e, TaudVoice *v, double div)
         v->currentMixVolume += v->volRampStep;
     }
 }
+
+/* Per-sample fadeout glide (sampler.js advanceFadeout): walk fadeoutMix down
+ * the slope the tick set, never below the tick's own multiplier — where the
+ * glide ends, and what makes a reset to 1 land at once. */
+double te_advance_fadeout(TaudVoice *v)
+{
+    double m = v->fadeoutMix + v->fadeoutMixStep;
+    v->fadeoutMix = m > v->fadeoutVolume ? m : v->fadeoutVolume;
+    return v->fadeoutMix;
+}
+
+/* One frame of a song-level gain's glide (sampler.js ByteGlide.fill, a frame
+ * at a time): over the volume ramp, re-aimed whenever the value moves. */
+double te_byte_glide_next(const TaudEngine *e, TaudByteGlide *g, int target)
+{
+    if (isnan(g->cur)) { g->cur = target; g->aim = target; g->left = 0; }
+    if (target != g->aim) {
+        g->aim = target;
+        g->step = (target - g->cur) / e->volRampSamples;
+        g->left = e->volRampSamples;
+    }
+    if (g->left > 0) {
+        g->left--;
+        g->cur = g->left == 0 ? target : g->cur + g->step;
+    }
+    return g->cur;
+}
+
+/* Per-sample glide of a voice's lane fader (sampler.js advanceFaderRamp). */
+double te_advance_fader_ramp(const TaudEngine *e, TaudVoice *v, int target)
+{
+    if (isnan(v->faderCur)) {
+        v->faderCur = target; v->faderAim = target; v->faderLeft = 0;
+        return target;
+    }
+    if (target != v->faderAim) {
+        v->faderAim = target;
+        v->faderStep = (target - v->faderCur) / e->volRampSamples;
+        v->faderLeft = e->volRampSamples;
+    }
+    if (v->faderLeft > 0) {
+        v->faderLeft--;
+        v->faderCur = v->faderLeft == 0 ? target : v->faderCur + v->faderStep;
+    }
+    return v->faderCur;
+}
+
+/* Per-sample glide of a voice's elevation (sampler.js advanceElevRamp). */
+double te_advance_elev_ramp(const TaudEngine *e, TaudVoice *v, double target)
+{
+    if (isnan(v->elevCur)) {
+        v->elevCur = target; v->elevAim = target; v->elevLeft = 0;
+        return target;
+    }
+    if (target != v->elevAim) {
+        v->elevAim = target;
+        v->elevStep = (target - v->elevCur) / e->volRampSamples;
+        v->elevLeft = e->volRampSamples;
+    }
+    if (v->elevLeft > 0) {
+        v->elevLeft--;
+        v->elevCur = v->elevLeft == 0 ? target : v->elevCur + v->elevStep;
+    }
+    return v->elevCur;
+}
