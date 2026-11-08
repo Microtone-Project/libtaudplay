@@ -104,6 +104,7 @@ void te_voice_init(TaudVoice *v)
     v->panbrelloRetrig = true;
     v->noteDelayTick = -1;
     v->delayedVol = -1;
+    v->delayedGlide = false;
     v->noteActionTick = -1;
     v->delayedAction = -1;
     v->cutAtTick = -1;

@@ -248,7 +248,7 @@ void te_apply_tracker_row(TaudEngine *e)
                 int trigVol = row->volumeEff == 0 ? row->volume : -1;
                 te_apply_duplicate_check(e, vi, row->instrment, voice->noteVal);
                 te_maybe_spawn_background_for_nna(e, voice, vi, row->instrment);
-                te_trigger_meta_or_note(e, voice, vi, voice->noteVal, row->instrment, trigVol);
+                te_trigger_meta_or_note(e, voice, vi, voice->noteVal, row->instrment, trigVol, false);
             } else if (row->instrment != 0 && !inst_is_meta(&e->instruments[row->instrment])) {
                 const TaudInst *newInst;
                 const TaudPatch *newPatch;
@@ -309,12 +309,15 @@ void te_apply_tracker_row(TaudEngine *e)
                 voice->delayedNote = note;
                 voice->delayedInst = row->instrment;
                 voice->delayedVol = row->volumeEff == 0 ? row->volume : -1;
+                voice->delayedGlide = toneG; /* a G/L on a silent lane: a glide's trigger (lyrics) */
                 schedule_dxny_action(voice, sArg, sDelayTick);
             } else {
                 int trigVol = row->volumeEff == 0 ? row->volume : -1;
                 te_apply_duplicate_check(e, vi, row->instrment, note);
                 te_maybe_spawn_background_for_nna(e, voice, vi, row->instrment);
-                te_trigger_meta_or_note(e, voice, vi, note, row->instrment, trigVol);
+                /* toneG here = a G/L on a silent lane: it triggers, but as a
+                 * glide (a lyric instrument's syllable, trigger.c lyric_trigger). */
+                te_trigger_meta_or_note(e, voice, vi, note, row->instrment, trigVol, toneG);
                 schedule_dxny_action(voice, sArg, sDelayTick);
             }
         }

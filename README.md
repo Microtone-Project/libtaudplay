@@ -302,6 +302,10 @@ where it has the flag, see [Numerics](#numerics)) runs:
   `FUZZ_S9=1` makes `S $9xxx` half of every effect command, on most rows;
   `FUZZ_CUTS=1` does the same for `S $70`…`S $76` (past-note actions, New Note
   Action overrides), best with `FUZZ_INSTS=layered`.
+  `FUZZ_GLIDES=1` puts tone portamentos (`G`, `L`) on lanes that keep going
+  silent, half of them delayed by `S $Dx` in a wide-cell song — a lyric
+  instrument's glide with nothing sounding — best with
+  `FUZZ_LYRIC=1 FUZZ_INSTS=formant`.
   `FUZZ_INSTS=opl`, `psg`, `formant`, `fm` or `layered` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
@@ -329,7 +333,7 @@ in spans between ticks; this one runs a frame at a time and finishes each span
 — the instrument buses, the fold-down, the Amiga filters — just before the
 tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 4.8.1 (Microtone.js 4.8.1, engine af37ee7d12dc). The
+In step with taudplay 4.8.3 (Microtone.js 4.8.3, engine ce007aa85fda). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

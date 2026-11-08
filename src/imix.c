@@ -326,6 +326,7 @@ static bool decode_equipment(int k, const uint8_t *p, size_t len, TaudImxEquipme
     case IMX_DLAY:
         e->u.dlay.sync = (p[4] & 1) != 0;
         e->u.dlay.pingPong = (p[4] & 2) != 0;
+        e->u.dlay.pingRight = (p[4] & 6) == 6;   /* right first: R-L-R-L */
         e->u.dlay.time = e->u.dlay.sync ? clampfx(rd_u32(p + 8), FX16 / 4, 1024u * FX16)
                                         : clampfx(rd_u32(p + 8), 66, IMX_DELAY_MAX_SEC * FX16);
         e->u.dlay.feedback = clampf(rd_f32(p + 12), 0, 1.2, 0.35);
@@ -1791,6 +1792,8 @@ static void delay_process(ImxDelay *s, double *data, int stride, int n0, int n1,
     double wowAmp = s->p.u.dlay.wow * WOW_SEC * fs;
     double flutAmp = s->p.u.dlay.wow * FLUTTER_SEC * fs;
     bool pingPong = s->p.u.dlay.pingPong && ctx->stereo && nch == 2;
+    /* The line the mid goes into (0 left, 1 right) and the other one. */
+    int pa = pingPong && s->p.u.dlay.pingRight ? 1 : 0, pb = 1 - pa;
     if (ctx->dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
     if (s->oom) return;
     s->t = delay_target(s, ctx->bpm);
@@ -1824,8 +1827,8 @@ static void delay_process(ImxDelay *s, double *data, int stride, int n0, int n1,
         }
         if (pingPong) {
             double mid = (s->xs[0] + s->xs[1]) * 0.5;
-            buf[w] = mid + s->fbs[1];
-            buf[len + w] = s->fbs[0];
+            buf[pa * len + w] = mid + s->fbs[pb];
+            buf[pb * len + w] = s->fbs[pa];
         } else {
             for (c = 0; c < nch; c++) buf[c * len + w] = s->xs[c] + s->fbs[c];
         }

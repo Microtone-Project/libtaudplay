@@ -423,7 +423,8 @@ void te_apply_tick_events(TaudEngine *e)
                 }
                 te_apply_duplicate_check(e, vi, voice->delayedInst, voice->delayedNote);
                 te_maybe_spawn_background_for_nna(e, voice, vi, voice->delayedInst);
-                te_trigger_meta_or_note(e, voice, vi, voice->delayedNote, voice->delayedInst, voice->delayedVol);
+                te_trigger_meta_or_note(e, voice, vi, voice->delayedNote, voice->delayedInst, voice->delayedVol,
+                                        voice->delayedGlide);
                 break;
             }
             voice->noteDelayTick = -1;

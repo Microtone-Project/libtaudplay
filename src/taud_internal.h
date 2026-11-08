@@ -870,6 +870,7 @@ struct TaudVoice {
     bool retrigFresh;
 
     int noteDelayTick, delayedNote, delayedInst, delayedVol;
+    bool delayedGlide;  /* the delayed note was a G/L's (a lyric's glide, trigger.c) */
     int delayedInterruptArg;
     int noteActionTick, delayedAction;
     int cutAtTick;
@@ -1120,7 +1121,7 @@ typedef struct {
         struct { int curve; float driveDb, inDb, outDb, bias; } sat;
         struct { int voices; float detune, width, spacing; TaudImxLfoParams detuneLfo, widthLfo; } unis;
         struct { float size, decay, damping; uint32_t preDelay; } verb;
-        struct { bool sync, pingPong; uint32_t time; float feedback, highCut, lowCut, wow, driveDb; } dlay;
+        struct { bool sync, pingPong, pingRight; uint32_t time; float feedback, highCut, lowCut, wow, driveDb; } dlay;
         struct { bool truePeak; float ceilingDb, releaseMs, gainDb; } lim;
         struct { bool swap, invL, invR, removeDc; float gainDb, width; } mx;
     } u;
@@ -1631,7 +1632,9 @@ void te_apply_active_sample(TaudVoice *v, const TaudInst *inst, const TaudPatch 
 int te_row_volume_from_default(const TaudInst *inst, const TaudPatch *patch, int volMax);
 void te_cap_background_voices(TaudEngine *e);
 void te_cut_layer_children(TaudEngine *e, int vi);
-void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, int noteVal, int instId, int rowVolOverride);
+/* glide: a G/L on a silent lane, triggering as its note's glide (lyrics). */
+void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, int noteVal, int instId, int rowVolOverride,
+                             bool glide);
 void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride,
                      const TaudFormantPatch *lyricPatch);
 int te_narrow_vol_axis(const TaudEngine *e, int v);

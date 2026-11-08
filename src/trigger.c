@@ -281,20 +281,40 @@ static bool fm_sounds(TaudEngine *e, const TaudMetaLayer *o, int noteVal, int se
  * any other instrument. An instrument byte starts the lyrics over; every
  * trigger sings the syllable at the lane's position and moves it on, back to
  * the first after the last. (The JS takes a lyricReset flag for the jam bank;
- * this library has no jam, so it is always set.) */
-static const TaudFormantPatch *lyric_trigger(TaudVoice *voice, const TaudInst *inst, int instId)
+ * this library has no jam, so it is always set.)
+ *
+ * A tone portamento (G, L) that triggers only because nothing is sounding on
+ * the lane — a play started after the note it glides, or a note that had run
+ * out — is still that note's glide (`glide`): it says the syllable the lane's
+ * note was singing again and leaves the position where it is, as a glide from
+ * a sounding note does. An instrument byte still starts the lyrics over,
+ * handing the note its first syllable when it was singing none of this
+ * instrument's (the porta row's instrument change, row.c apply_instrument_change). */
+static const TaudFormantPatch *lyric_trigger(TaudVoice *voice, const TaudInst *inst, int instId, bool glide)
 {
     const TaudFormantPatch *syl;
     int n;
     if (inst->lyric == NULL) return NULL;
     n = inst->lyricEntry->numSyllables;
+    if (glide) {
+        const TaudFormantPatch *cur = voice->formant != NULL ? voice->formant->patch : NULL;
+        int k = -1, i;
+        /* JS inst.lyric.indexOf(cur): the syllable patches are this array. */
+        if (cur != NULL) for (i = 0; i < n; i++) if (&inst->lyric[i] == cur) { k = i; break; }
+        if (instId != 0) {
+            voice->lyricPos = 0;
+            return k >= 0 ? cur : &inst->lyric[0];
+        }
+        if (k >= 0) return cur;
+    }
     if (instId != 0 || voice->lyricPos >= n) voice->lyricPos = 0;
     syl = &inst->lyric[voice->lyricPos];
     voice->lyricPos = voice->lyricPos + 1 >= n ? 0 : voice->lyricPos + 1;
     return syl;
 }
 
-void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVal, int instId, int rowVolOverride)
+void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVal, int instId, int rowVolOverride,
+                             bool glide)
 {
     const TaudInst *inst;
     const TaudMetaLayer *layers[META_MAX_LAYERS];
@@ -313,7 +333,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     te_drop_fm_operators(e, vi);
     inst = instId != 0 ? &e->instruments[instId] : &e->instruments[voice->instrumentId];
     if (!inst_is_meta(inst)) {
-        te_trigger_note(e, voice, noteVal, instId, rowVolOverride, lyric_trigger(voice, inst, instId));
+        te_trigger_note(e, voice, noteVal, instId, rowVolOverride, lyric_trigger(voice, inst, instId, glide));
         voice->layerMixGain = 1.0;
         voice->layerRelDetune = 0;
         voice->layerFixedNote = -1;
