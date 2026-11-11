@@ -79,6 +79,7 @@ void te_voice_init(TaudVoice *v)
     v->activeChanCount = 1;
     v->right.nesDpcmCounter = 63;
     v->activeVolEnv = DEFAULT_ENV_3F;
+    v->activeVolEnvMax = 63;
     v->activePanEnv = DEFAULT_ENV_80;
     v->activePitchEnv = DEFAULT_ENV_80;
     v->activeFilterEnv = DEFAULT_ENV_80;
@@ -280,6 +281,7 @@ static void cell_set_byte_wide(TaudCell *c, int o, int b)
     case 10: c->effect2 = b; break;
     case 11: c->effectArg2 = (c->effectArg2 & 0xff00) | b; break;
     case 12: c->effectArg2 = (c->effectArg2 & 0x00ff) | (b << 8); break;
+    case 13: c->noteFine = (uint8_t)(b >> 4); break; /* low nibble RESERVED */
     default: break;
     }
 }

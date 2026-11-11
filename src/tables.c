@@ -168,7 +168,7 @@ double te_atten_gain_of(int octet) { return octet <= 0 ? 1.0 : META_MIX_GAIN[oct
 
 /* ── pitch conversions ── */
 
-double te_note_val_to_amiga_period(int noteVal)
+double te_note_val_to_amiga_period(double noteVal)
 {
     return AMIGA_BASE_PERIOD * js_pow(2.0, -(noteVal - MIDDLE_C) / 4096.0);
 }
@@ -178,7 +178,7 @@ int te_amiga_period_to_note_val(double period)
     return (int)js_round(MIDDLE_C + 4096.0 * js_log2(AMIGA_BASE_PERIOD / period));
 }
 
-double te_note_val_to_freq_hz(int noteVal)
+double te_note_val_to_freq_hz(double noteVal)
 {
     return LINEAR_FREQ_C4_HZ * js_pow(2.0, (noteVal - MIDDLE_C) / 4096.0);
 }
@@ -204,7 +204,7 @@ int te_amiga_slide_tick(TaudVoice *v, int slideArg)
     return te_amiga_period_to_note_val(v->amigaPeriod);
 }
 
-int te_amiga_slide_once(int noteVal, int slideArg)
+int te_amiga_slide_once(double noteVal, int slideArg)
 {
     double period = te_note_val_to_amiga_period(noteVal);
     double np = dmax(period - slideArg, 1.0);
@@ -218,7 +218,7 @@ int te_linear_freq_slide_tick(TaudVoice *v, int slideArg)
     return te_freq_hz_to_note_val(v->linearFreq);
 }
 
-int te_linear_freq_slide_once(int noteVal, int slideArg)
+int te_linear_freq_slide_once(double noteVal, int slideArg)
 {
     double freq = te_note_val_to_freq_hz(noteVal);
     double nf = dmax(freq + slideArg, 1.0);

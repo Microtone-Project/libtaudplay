@@ -103,7 +103,7 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
     if (!(mayCarry && te_env_carry(v->activeVolEnvLoop))) {
         v->envIndex = 0;
         v->envTimeSec = 0.0;
-        v->envVolume = dclamp(v->activeVolEnv[0].value / 63.0, 0.0, 1.0);
+        v->envVolume = dclamp(v->activeVolEnv[0].value / (double)v->activeVolEnvMax, 0.0, 1.0);
     }
     v->hasPanEnv = te_env_present(v->activePanEnvLoop);
     if (!(mayCarry && te_env_carry(v->activePanEnvLoop))) {
@@ -149,7 +149,8 @@ void te_apply_tracker_row(TaudEngine *e)
 
     for (vi = 0; vi < channels; vi++) {
         int patNum = cue->raw[vi] & 0x7fff;
-        int patIdx, n, dittoArmRow, note, sArg, sDelayTick;
+        int patIdx, n, dittoArmRow, sArg, sDelayTick;
+        double note;
         const TaudCell *rows, *rawRow, *row;
         TaudCell dittoRow;
         TaudVoice *voice;
@@ -194,7 +195,9 @@ void te_apply_tracker_row(TaudEngine *e)
             else if (src->effect != OP_7) { effOp = src->effect; effArg = src->effectArg; }
             else { effOp = 0; effArg = 0; }
 
+            /* The note travels whole: its word and its sixteenths. */
             dittoRow.note = rawRow->note != 0 ? rawRow->note : src->note;
+            dittoRow.noteFine = rawRow->note != 0 ? rawRow->noteFine : src->noteFine;
             dittoRow.instrment = rawRow->instrment != 0 ? rawRow->instrment : src->instrment;
             dittoRow.volume = volIsSet ? rawRow->volume : src->volume;
             dittoRow.volumeEff = volIsSet ? rawRow->volumeEff : src->volumeEff;
@@ -238,7 +241,7 @@ void te_apply_tracker_row(TaudEngine *e)
 
         /* ── Note ── */
         toneG = row->effect == OP_G || row->effect == OP_L;
-        note = row->note;
+        note = te_cell_note(row);
         sArg = s_delay_arg(e, row);
         sDelayTick = sArg < 0 ? 0 : (sArg >> 8) & 0xf;
 
@@ -284,17 +287,18 @@ void te_apply_tracker_row(TaudEngine *e)
             /* reserved sentinel range */
         } else if (note >= 0x0010 && note <= 0x001f) {
             if (sDelayTick > 0) {
-                defer_note(voice, sDelayTick, note);
+                defer_note(voice, sDelayTick, (int)note);
                 voice->delayedInterruptArg = interrupt_arg_of(e, row);
             } else {
-                e->pendingInterrupts |= 1u << (note - 0x0010);
-                e->interruptArgs[note - 0x0010] = (uint16_t)interrupt_arg_of(e, row);
+                int k = (int)note - 0x0010;
+                e->pendingInterrupts |= 1u << k;
+                e->interruptArgs[k] = (uint16_t)interrupt_arg_of(e, row);
             }
         } else {
             if (toneG && voice->active) {
                 voice->tonePortaTarget = voice->metaForeground && voice->layerFixedNote >= 0
                     ? -1
-                    : iclamp(note + voice->metaForegroundDetune, 0x20, 0xffff);
+                    : dclamp(note + voice->metaForegroundDetune, 0x20, 0xffff);
                 if (row->instrment != 0 && !inst_is_meta(&e->instruments[row->instrment])) {
                     bool mayCarry = !voice->keyOff && !voice->noteFading && row->instrment == voice->instrumentId;
                     const TaudInst *newInst;

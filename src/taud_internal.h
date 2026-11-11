@@ -610,6 +610,10 @@ static inline bool inst_is_psg(const TaudInst *i) { return i->psg != NULL; }
 /* A chip instrument (OPL or PSG): what a high meta can sound through (chipPatch). */
 static inline bool inst_is_chip(const TaudInst *i) { return i->opl != NULL || i->psg != NULL; }
 static inline bool inst_is_formant(const TaudInst *i) { return i->formant != NULL; }
+/* Byte 14 bit 6: this instrument's volume envelopes — its own and its Ixmp
+ * patches' — hold 0…255 rather than 0…63 (file format §7.2). */
+#define INST_VOLENV8 0x40
+static inline bool inst_vol_env8(const TaudInst *i) { return (i->loopMode & INST_VOLENV8) != 0; }
 
 /* The metainstrument tiers (inst.js metaTier): types 0…7 are HIGH metas, made
  * out of sources; 8…13 LOW metas, sound generators of their own; 14, 15
@@ -720,11 +724,11 @@ struct TaudVoice {
     int activePatchIndex;
 
     bool isLayerChild;
-    int layerRelDetune;
+    double layerRelDetune;
     int layerFixedNote;
     double layerRelPan, layerRelElevation;
     double layerMixGain;
-    int layerPitchMod;
+    double layerPitchMod;
     int nnaOverride;
     bool volEnvOn, panEnvOn, pitchEnvOn, filterEnvOn;
     bool metaForeground;
@@ -809,6 +813,9 @@ struct TaudVoice {
 
     const TaudEnvPoint *activeVolEnv;
     int activeVolEnvLoop, activeVolEnvSustain;
+    /* A node value's full volume: 63, or 255 for an instrument whose byte 14
+     * bit 6 says its volume envelopes are 8-bit (resolve_active_envelopes). */
+    int activeVolEnvMax;
     const TaudEnvPoint *activePanEnv;
     int activePanEnvLoop, activePanEnvSustain;
     const TaudEnvPoint *activePitchEnv;
@@ -835,14 +842,15 @@ struct TaudVoice {
 
     int randomVolBias, randomPanBias;
 
-    int noteVal, basePitch;
+    double noteVal, basePitch;  /* 4096-TET; a wide cell's note carries sixteenths */
     double amigaPeriod, linearFreq;
-    int renderPitch;
-    int pitchModDelta;
+    double renderPitch;
+    double pitchModDelta;
 
     int rowEffect, rowEffectArg;
     int slideMode, slideArg;
-    int tonePortaTarget, tonePortaSpeed;
+    double tonePortaTarget;
+    int tonePortaSpeed;
     int arpOff1, arpOff2;
     bool arpActive;
     int lastArpVoice;
@@ -869,7 +877,9 @@ struct TaudVoice {
      * by the restart, whose chip then keys on from silence. */
     bool retrigFresh;
 
-    int noteDelayTick, delayedNote, delayedInst, delayedVol;
+    int noteDelayTick;
+    double delayedNote;
+    int delayedInst, delayedVol;
     bool delayedGlide;  /* the delayed note was a G/L's (a lyric's glide, trigger.c) */
     int delayedInterruptArg;
     int noteActionTick, delayedAction;
@@ -914,8 +924,11 @@ struct TaudVoice {
 
 /* ── pattern data + cue sheet (state.js) ───────────────────────────────── */
 
-/* One pattern cell, either wire layout (8-byte v1/2 or 16-byte v3). Kept to
- * 16 bytes: a song holds hundreds of 64-row patterns. */
+/* One pattern cell, either wire layout (8-byte v1/2 or 16-byte v3). Kept
+ * small: a song holds hundreds of 64-row patterns. The note is stored as it
+ * arrives — the word, and a wide cell's fine nibble (byte 13's high nibble,
+ * the four bits that make its pitch 65536-TET, file format §5.5) — and read
+ * through te_cell_note. */
 typedef struct {
     uint16_t note;
     uint8_t instrment, volume, volumeEff, pan, panEff, effect;
@@ -923,7 +936,15 @@ typedef struct {
     int8_t elevation;
     uint8_t effect2;
     uint16_t effectArg2;
+    uint8_t noteFine;           /* 0..15; always 0 in a narrow cell */
 } TaudCell;
+
+/* The cell's note in 4096-TET units: the word plus sixteenths. A sentinel
+ * word (< $20) takes no fraction (the nibble is RESERVED under one). */
+static inline double te_cell_note(const TaudCell *c)
+{
+    return c->note >= 0x20 ? c->note + c->noteFine / 16.0 : (double)c->note;
+}
 
 #define INST_NOP 0
 #define INST_GOBACK 1
@@ -1396,15 +1417,15 @@ int te_advance_lfo_phase(int pos, int speed);
 int te_lfo_sample(TaudEngine *e, int pos, int wave);
 int te_lfo_sample_wide(TaudEngine *e, int pos, int wave);
 double te_atten_gain_of(int octet);
-double te_note_val_to_amiga_period(int noteVal);
+double te_note_val_to_amiga_period(double noteVal);
 int te_amiga_period_to_note_val(double period);
-double te_note_val_to_freq_hz(int noteVal);
+double te_note_val_to_freq_hz(double noteVal);
 int te_freq_hz_to_note_val(double freq);
 double te_tuning_ratio_of(int baseNote, double freq);
 int te_amiga_slide_tick(TaudVoice *v, int slideArg);
-int te_amiga_slide_once(int noteVal, int slideArg);
+int te_amiga_slide_once(double noteVal, int slideArg);
 int te_linear_freq_slide_tick(TaudVoice *v, int slideArg);
-int te_linear_freq_slide_once(int noteVal, int slideArg);
+int te_linear_freq_slide_once(double noteVal, int slideArg);
 
 /* minifloat */
 extern const float MINIFLOAT_LUT[256];
@@ -1416,12 +1437,12 @@ void te_inst_free(TaudInst *inst);
 void te_inst_load_record(TaudInst *inst, const uint8_t *b);
 void te_inst_set_lyric(TaudInst *inst, const TaudLyricEntry *entry);
 int te_parse_patches_blob(const uint8_t *bytes, size_t len, TaudPatch **out);
-const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, int noteVal, int rowVolume);
+const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, double noteVal, int rowVolume);
 const TaudPatch *te_patch_at(const TaudInst *inst, int patchIndex);
-int te_inst_resolve_meta_layers(const TaudInst *inst, int noteVal, int rowVolume, const TaudMetaLayer **out);
+int te_inst_resolve_meta_layers(const TaudInst *inst, double noteVal, int rowVolume, const TaudMetaLayer **out);
 bool te_patch_is_stereo(const TaudPatch *p);
 bool te_patch_vibrato_inherits(const TaudPatch *p);
-static inline int te_layer_note(const TaudMetaLayer *l, int noteVal)
+static inline double te_layer_note(const TaudMetaLayer *l, double noteVal)
 {
     return l->fixedPitch ? (l->detune & 0xffff) : noteVal + l->detune;
 }
@@ -1493,7 +1514,7 @@ static inline bool te_is_jump_op(int op) { return op >= MOD_JUMP8 && op <= MOD_J
 static inline bool te_is_rnd_op(int op) { return op >= MOD_RND512 && op <= MOD_RND8; }
 
 /* sampler.c */
-double te_compute_playback_rate(const TaudEngine *e, const TaudVoice *v, int noteVal, double tuningRatio);
+double te_compute_playback_rate(const TaudEngine *e, const TaudVoice *v, double noteVal, double tuningRatio);
 double te_fetch_tracker_sample(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double posOffset);
 void te_fetch_tracker_sample_stereo(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double out[2]);
 void te_start_ramp_out(TaudEngine *e, TaudVoice *v);
@@ -1633,12 +1654,12 @@ int te_row_volume_from_default(const TaudInst *inst, const TaudPatch *patch, int
 void te_cap_background_voices(TaudEngine *e);
 void te_cut_layer_children(TaudEngine *e, int vi);
 /* glide: a G/L on a silent lane, triggering as its note's glide (lyrics). */
-void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, int noteVal, int instId, int rowVolOverride,
+void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, double noteVal, int instId, int rowVolOverride,
                              bool glide);
-void te_trigger_note(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride,
+void te_trigger_note(TaudEngine *e, TaudVoice *v, double noteVal, int instId, int volOverride,
                      const TaudFormantPatch *lyricPatch);
 int te_narrow_vol_axis(const TaudEngine *e, int v);
-void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note);
+void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, double note);
 void te_maybe_spawn_background_for_nna(TaudEngine *e, TaudVoice *v, int channel, int incomingInst);
 void te_retrig_hand_off(TaudEngine *e, TaudVoice *voice, int vi);
 void te_apply_past_note_action(TaudEngine *e, int channel, int action);

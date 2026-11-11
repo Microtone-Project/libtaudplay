@@ -185,7 +185,7 @@ done:
     return n;
 }
 
-const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, int noteVal, int rowVolume)
+const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, double noteVal, int rowVolume)
 {
     int i;
     /* An OPL, PSG or formant instrument has no keyboard map (§7.8, §7.9,
@@ -201,7 +201,7 @@ const TaudPatch *te_inst_resolve_patch(const TaudInst *inst, int noteVal, int ro
 
 /* All meta layers whose rectangle contains the trigger, in record order.
  * Writes pointers into out[] (capacity META_MAX_LAYERS), returns the count. */
-int te_inst_resolve_meta_layers(const TaudInst *inst, int noteVal, int rowVolume, const TaudMetaLayer **out)
+int te_inst_resolve_meta_layers(const TaudInst *inst, double noteVal, int rowVolume, const TaudMetaLayer **out)
 {
     int i, n = 0;
     if (inst->meta == NULL) return 0;
@@ -293,7 +293,7 @@ static void inst_set_byte(TaudInst *t, int o, int byte)
     case 11: t->sampleLoopStart = (t->sampleLoopStart & 0x00ff) | (byte << 8); break;
     case 12: t->sampleLoopEnd = (t->sampleLoopEnd & 0xff00) | byte; break;
     case 13: t->sampleLoopEnd = (t->sampleLoopEnd & 0x00ff) | (byte << 8); break;
-    case 14: t->loopMode = byte & 0x37; break;
+    case 14: t->loopMode = byte & 0x77; break; /* bit 6: 8-bit volume envelopes */
     case 15: t->volEnvLoop = (t->volEnvLoop & 0xff00) | byte; break;
     case 16: t->volEnvLoop = (t->volEnvLoop & 0x00ff) | (byte << 8); break;
     case 17: t->panEnvLoop = (t->panEnvLoop & 0xff00) | byte; break;

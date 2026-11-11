@@ -8,7 +8,7 @@
  * [notePan, noteElevation, present]. Read only by triggerMetaOrNote. */
 typedef struct { double pan, elevation; bool present; } NotePanSeed;
 
-static void trigger_note_seed(TaudEngine *e, TaudVoice *v, int noteVal, int instId, int volOverride, NotePanSeed *seed,
+static void trigger_note_seed(TaudEngine *e, TaudVoice *v, double noteVal, int instId, int volOverride, NotePanSeed *seed,
                               const TaudFormantPatch *lyricPatch);
 
 void te_apply_active_sample(TaudVoice *v, const TaudInst *inst, const TaudPatch *patch);
@@ -28,6 +28,9 @@ static void resolve_active_envelopes(TaudVoice *v, const TaudInst *inst, const T
         v->activeVolEnvLoop = inst->volEnvLoop;
         v->activeVolEnvSustain = inst->volEnvSustainWord;
     }
+    /* An Ixmp patch's volume envelope is in its instrument's units: byte 14's
+     * bit 6 says whether a node's full volume is 63 or 255 (file format §7.2). */
+    v->activeVolEnvMax = inst_vol_env8(inst) ? 255 : 63;
     /* The volume envelope answers to its P bit like every other envelope (spec
      * §7.2): a record that says "absent" plays at unity whatever its nodes hold. */
     v->hasVolEnv = te_env_present(v->activeVolEnvLoop);
@@ -239,9 +242,9 @@ void te_cut_layer_children(TaudEngine *e, int vi)
     }
 }
 
-static inline int pitch_of(const TaudMetaLayer *l, int noteVal)
+static inline double pitch_of(const TaudMetaLayer *l, double noteVal)
 {
-    return iclamp(te_layer_note(l, noteVal), 0x20, 0xffff);
+    return dclamp(te_layer_note(l, noteVal), 0x20, 0xffff);
 }
 
 static void seed_child_lane_context(TaudVoice *child, const TaudVoice *voice, int chanPan, int chanRowPan,
@@ -261,10 +264,10 @@ static void seed_child_lane_context(TaudVoice *child, const TaudVoice *voice, in
     child->overdriveAmp = voice->overdriveAmp;
 }
 
-static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal, const TaudInst *inst,
+static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, double noteVal, const TaudInst *inst,
                             int rowVolOverride, int seedVol);
 
-static bool fm_sounds(TaudEngine *e, const TaudMetaLayer *o, int noteVal, int seedVol)
+static bool fm_sounds(TaudEngine *e, const TaudMetaLayer *o, double noteVal, int seedVol)
 {
     /* An operator is an ordinary instrument or a low meta (an OPL channel or
      * a PSG pair, read as the chip reads its carriers — fm.c). A high meta is
@@ -313,7 +316,7 @@ static const TaudFormantPatch *lyric_trigger(TaudVoice *voice, const TaudInst *i
     return syl;
 }
 
-void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVal, int instId, int rowVolOverride,
+void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, double noteVal, int instId, int rowVolOverride,
                              bool glide)
 {
     const TaudInst *inst;
@@ -383,7 +386,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     l0Elevation = l0HasPan ? seed.elevation : 0;
     voice->layerMixGain = META_MIX_GAIN[l0->mixOctet & 0xff];
     voice->layerRelDetune = 0;
-    voice->layerFixedNote = l0->fixedPitch ? pitch_of(l0, noteVal) : -1;
+    voice->layerFixedNote = l0->fixedPitch ? (int)pitch_of(l0, noteVal) : -1;
     voice->layerRelPan = 0;
     voice->layerRelElevation = 0;
     voice->isLayerChild = false;
@@ -399,7 +402,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
         child->sourceChannel = vi;
         child->displayInst = voice->displayInst;
         child->layerRelDetune = te_layer_note(lk, noteVal) - te_layer_note(l0, noteVal);
-        child->layerFixedNote = lk->fixedPitch ? pitch_of(lk, noteVal) : -1;
+        child->layerFixedNote = lk->fixedPitch ? (int)pitch_of(lk, noteVal) : -1;
         if (seed.present) {
             child->layerRelPan = seed.pan - l0Pan;
             child->layerRelElevation = seed.elevation - l0Elevation;
@@ -415,7 +418,7 @@ void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *voice, int vi, int noteVa
     te_cap_background_voices(e);
 }
 
-static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal, const TaudInst *inst,
+static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, double noteVal, const TaudInst *inst,
                             int rowVolOverride, int seedVol)
 {
     const TaudMeta *meta = inst->meta;
@@ -443,7 +446,7 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
     te_trigger_note(e, voice, pitch_of(&ops[0], noteVal), ops[0].instIdx, rowVolOverride, NULL);
     voice->layerMixGain = 1.0;
     voice->layerRelDetune = 0;
-    voice->layerFixedNote = ops[0].fixedPitch ? pitch_of(&ops[0], noteVal) : -1;
+    voice->layerFixedNote = ops[0].fixedPitch ? (int)pitch_of(&ops[0], noteVal) : -1;
     voice->layerRelPan = 0;
     voice->layerRelElevation = 0;
     voice->isLayerChild = false;
@@ -473,7 +476,7 @@ static void trigger_fm_rack(TaudEngine *e, TaudVoice *voice, int vi, int noteVal
         op->sourceChannel = vi;
         op->displayInst = voice->displayInst;
         op->layerRelDetune = te_layer_note(&ops[k], noteVal) - te_layer_note(&ops[0], noteVal);
-        op->layerFixedNote = ops[k].fixedPitch ? pitch_of(&ops[k], noteVal) : -1;
+        op->layerFixedNote = ops[k].fixedPitch ? (int)pitch_of(&ops[k], noteVal) : -1;
         op->layerMixGain = 1.0;
         op->layerRelPan = 0;
         op->layerRelElevation = 0;
@@ -490,14 +493,14 @@ int te_narrow_vol_axis(const TaudEngine *e, int v)
     return iclamp(e->ts_wideCells ? asr32(v, 2) : v, 0, 0x3f);
 }
 
-void te_trigger_note(TaudEngine *e, TaudVoice *voice, int noteVal, int instId, int volOverride,
+void te_trigger_note(TaudEngine *e, TaudVoice *voice, double noteVal, int instId, int volOverride,
                      const TaudFormantPatch *lyricPatch)
 {
     NotePanSeed seed;
     trigger_note_seed(e, voice, noteVal, instId, volOverride, &seed, lyricPatch);
 }
 
-static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int instId, int volOverride, NotePanSeed *seed,
+static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, double noteVal, int instId, int volOverride, NotePanSeed *seed,
                               const TaudFormantPatch *lyricPatch)
 {
     bool mayCarry = voice->active && !voice->keyOff && !voice->noteFading &&
@@ -535,7 +538,7 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
     if (!(mayCarry && te_env_carry(voice->activeVolEnvLoop))) {
         voice->envIndex = 0;
         voice->envTimeSec = 0.0;
-        voice->envVolume = dclamp(voice->activeVolEnv[0].value / 63.0, 0.0, 1.0);
+        voice->envVolume = dclamp(voice->activeVolEnv[0].value / (double)voice->activeVolEnvMax, 0.0, 1.0);
         voice->envVolMix = voice->envVolume;
         voice->envVolStep = 0.0;
     }
@@ -672,7 +675,7 @@ static void trigger_note_seed(TaudEngine *e, TaudVoice *voice, int noteVal, int 
 
 /* What a trigger of (instId, note) sounds on the foreground voice: only an FM
  * rack shifts it, to operator 0's instrument and detune. */
-static void principal_of(TaudEngine *e, int instId, int note, int *outInst, int *outNote)
+static void principal_of(TaudEngine *e, int instId, double note, int *outInst, double *outNote)
 {
     const TaudInst *inst = &e->instruments[instId];
     const TaudMetaLayer *op0;
@@ -682,10 +685,10 @@ static void principal_of(TaudEngine *e, int instId, int note, int *outInst, int 
     op0 = &inst->meta->layers[0];
     if (op0->instIdx < 1 || op0->instIdx > 1023) return;
     *outInst = op0->instIdx;
-    *outNote = iclamp(te_layer_note(op0, note), 0x20, 0xffff);
+    *outNote = dclamp(te_layer_note(op0, note), 0x20, 0xffff);
 }
 
-typedef struct { int newInstId, newNote; uint32_t newSmpPtr; int newSmpLen; } DupKey;
+typedef struct { int newInstId; double newNote; uint32_t newSmpPtr; int newSmpLen; } DupKey;
 
 static bool is_duplicate(TaudEngine *e, const TaudVoice *v, const DupKey *k, bool bare)
 {
@@ -733,7 +736,7 @@ static void apply_dup_action(TaudEngine *e, TaudVoice *v, bool isFg, int channel
     }
 }
 
-void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, int note)
+void te_apply_duplicate_check(TaudEngine *e, int channel, int instId, double note)
 {
     DupKey k;
     const TaudInst *newInst;
@@ -891,6 +894,7 @@ static TaudVoice *ghost_voice(TaudEngine *e, const TaudVoice *src, int channel)
     v->activeVolEnv = src->activeVolEnv;
     v->activeVolEnvLoop = src->activeVolEnvLoop;
     v->activeVolEnvSustain = src->activeVolEnvSustain;
+    v->activeVolEnvMax = src->activeVolEnvMax;
     v->activePanEnv = src->activePanEnv;
     v->activePanEnvLoop = src->activePanEnvLoop;
     v->activePanEnvSustain = src->activePanEnvSustain;

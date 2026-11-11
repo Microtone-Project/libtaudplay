@@ -105,12 +105,13 @@ void te_apply_effect_row(TaudEngine *e, TaudVoice *voice, int vi, int op, int ra
         bool up = op == OP_F;
         if (rawArg != 0) voice->mem.ef = arg;
         if ((arg & 0xf000) == 0xf000) {
-            int mag = arg & 0x0fff, nv;
+            int mag = arg & 0x0fff;
             int delta = up ? mag : -mag;
+            double nv;
             if (e->toneMode == 1) nv = te_amiga_slide_once(voice->noteVal, delta);
             else if (e->toneMode == 2) nv = te_linear_freq_slide_once(voice->noteVal, delta);
             else nv = voice->noteVal + delta;
-            voice->noteVal = iclamp(nv, 0x20, 0xffff);
+            voice->noteVal = dclamp(nv, 0x20, 0xffff);
             voice->basePitch = voice->noteVal;
             voice->amigaPeriod = -1.0;
             voice->linearFreq = -1.0;
@@ -347,7 +348,7 @@ static void apply_s_effect(TaudEngine *e, TaudVoice *voice, int vi, int arg)
         break;
     case 0x1: voice->glissandoOn = x != 0; break;
     case 0x2:
-        voice->noteVal = iclamp(voice->noteVal + FINETUNE_OFFSET[x], 0x20, 0xffff);
+        voice->noteVal = dclamp(voice->noteVal + FINETUNE_OFFSET[x], 0x20, 0xffff);
         voice->basePitch = voice->noteVal;
         voice->amigaPeriod = -1.0;
         voice->linearFreq = -1.0;

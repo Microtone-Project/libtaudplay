@@ -281,7 +281,9 @@ where it has the flag, see [Numerics](#numerics)) runs:
   interrupts, the dithered 8-bit output, and non-48 kHz engine rates. Audio and
   every probe reading (as raw bits) must match.
 - `tests/fuzz.sh` — differential fuzzing: `tests/gen_fuzz.mjs` writes random but
-  valid songs (both cell formats, 32/64 lanes, stereo/planar/spatial, envelopes,
+  valid songs (both cell formats — the wide cell's notes with their sixteenths,
+  65536-TET, on half the cells — 32/64 lanes, stereo/planar/spatial, envelopes
+  in 6 and 8 bits,
   IT/SF2 filters, NNA and duplicate checks including the lane check, Ixmp
   patches including stereo ones, layered and FM metainstruments with chip
   operators among them, table kinds the engine does not know, OPL channels of
@@ -306,11 +308,15 @@ where it has the flag, see [Numerics](#numerics)) runs:
   silent, half of them delayed by `S $Dx` in a wide-cell song — a lyric
   instrument's glide with nothing sounding — best with
   `FUZZ_LYRIC=1 FUZZ_INSTS=formant`.
+  `FUZZ_REPEAT=1` plays four pitches only, each with its own sixteenths, on
+  three instruments whose Duplicate Check is the same-note kind, with
+  glissando (`S $1x`) switched on and off — the same pitch keeps coming back,
+  one of them just past a semitone's rounding edge.
   `FUZZ_INSTS=opl`, `psg`, `formant`, `fm` or `layered` narrows the patterns to one kind;
   `FUZZ_WILD=1` fills the OPL, PSG and formant blocks with random bytes.
 
 At the time of writing all of it is bit-identical against Node 26 (V8 14.6):
-the sixteen files of the Microtone corpus and demos (every song, both monitor
+the seventeen files of the Microtone corpus and demos (every song, both monitor
 modes), and hundreds of fuzzed songs.
 
 ## Relationship to the JS library
@@ -333,7 +339,7 @@ in spans between ticks; this one runs a frame at a time and finishes each span
 — the instrument buses, the fold-down, the Amiga filters — just before the
 tick that ends it, which adds everything in the same order.)
 
-In step with taudplay 4.8.3 (Microtone.js 4.8.3, engine ce007aa85fda). The
+In step with taudplay 4.10.0 (Microtone.js 4.10.0, engine 25b432cfdc38). The
 engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
 `TaudRenderer` this library mirrors does not use it, and seeking here is
 `taud_seek_cue`, as it is there.

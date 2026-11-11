@@ -400,7 +400,9 @@ void te_apply_tick_events(TaudEngine *e)
         }
 
         if (voice->noteDelayTick == e->tickInRow) {
-            switch (voice->delayedNote) {
+            /* Only a sentinel (< $20) is a case; a note — which may carry
+             * sixteenths — falls through to the trigger. */
+            switch (voice->delayedNote < 0x20 ? (int)voice->delayedNote : -1) {
             case 0x0001:
                 voice->keyOff = true;
                 te_apply_key_lift(voice, &e->instruments[voice->instrumentId]);
@@ -417,8 +419,9 @@ void te_apply_tick_events(TaudEngine *e)
                 break;
             default:
                 if (voice->delayedNote >= 0x0010 && voice->delayedNote <= 0x001f) {
-                    e->pendingInterrupts |= 1u << (voice->delayedNote - 0x0010);
-                    e->interruptArgs[voice->delayedNote - 0x0010] = (uint16_t)voice->delayedInterruptArg;
+                    int k = (int)voice->delayedNote - 0x0010;
+                    e->pendingInterrupts |= 1u << k;
+                    e->interruptArgs[k] = (uint16_t)voice->delayedInterruptArg;
                     break;
                 }
                 te_apply_duplicate_check(e, vi, voice->delayedInst, voice->delayedNote);
@@ -445,7 +448,8 @@ void te_apply_tracker_tick(TaudEngine *e)
 
     for (vi = 0; vi < MAX_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
-        int pitchToMixer, autoVibDelta, finalPitch;
+        double pitchToMixer, finalPitch;
+        int autoVibDelta;
         if (!voice->active && voice->noteDelayTick < 0 && voice->noteActionTick < 0) continue;
 
         if (!voice->active) {
@@ -456,17 +460,17 @@ void te_apply_tracker_tick(TaudEngine *e)
 
         /* Pitch slides (E/F coarse on tick > 0). */
         if (e->tickInRow > 0 && (voice->slideMode == 1 || voice->slideMode == 2)) {
-            int nv;
+            double nv;
             if (e->toneMode == 1) nv = te_amiga_slide_tick(voice, voice->slideArg);
             else if (e->toneMode == 2) nv = te_linear_freq_slide_tick(voice, voice->slideArg);
             else nv = voice->noteVal + voice->slideArg;
-            voice->noteVal = iclamp(nv, 0x20, 0xffff);
+            voice->noteVal = dclamp(nv, 0x20, 0xffff);
             voice->basePitch = voice->noteVal;
         }
 
         /* Tone portamento (G). */
         if (voice->tonePortaTarget >= 0 && e->tickInRow > 0) {
-            int target = voice->tonePortaTarget;
+            double target = voice->tonePortaTarget;
             int sp = voice->tonePortaSpeed;
             if (e->toneMode == 2) {
                 double targetFreq, dir;
@@ -479,7 +483,7 @@ void te_apply_tracker_tick(TaudEngine *e)
                     voice->noteVal = target;
                     voice->tonePortaTarget = -1;
                 } else {
-                    voice->noteVal = iclamp(te_freq_hz_to_note_val(voice->linearFreq), 0x20, 0xffff);
+                    voice->noteVal = dclamp(te_freq_hz_to_note_val(voice->linearFreq), 0x20, 0xffff);
                 }
                 voice->basePitch = voice->noteVal;
                 voice->amigaPeriod = -1.0;
@@ -544,13 +548,13 @@ void te_apply_tracker_tick(TaudEngine *e)
         if (voice->vibratoActive) {
             int sine = te_lfo_sample_wide(e, voice->vibratoLfoPos, voice->vibratoWave);
             int pitchDelta = asr32(sine * voice->mem.huDepth, voice->vibratoFineShift);
-            pitchToMixer = iclamp(voice->noteVal + pitchDelta, 0x20, 0xffff);
+            pitchToMixer = dclamp(voice->noteVal + pitchDelta, 0x20, 0xffff);
             voice->vibratoLfoPos = te_advance_lfo_phase(voice->vibratoLfoPos, voice->mem.huSpeed);
         }
 
         /* Glissando (S $1x). */
         if (voice->glissandoOn) {
-            int semis = (pitchToMixer * 12 + 2048) / 4096;
+            int semis = (int)trunc((pitchToMixer * 12 + 2048) / 4096);
             pitchToMixer = iclamp((semis * 4096) / 12, 0x20, 0xffff);
         }
 
@@ -575,7 +579,7 @@ void te_apply_tracker_tick(TaudEngine *e)
         if (voice->arpActive) {
             int voiceIdx = e->tickInRow % 3;
             int arpDelta = voiceIdx == 1 ? voice->arpOff1 : voiceIdx == 2 ? voice->arpOff2 : 0;
-            pitchToMixer = iclamp(voice->basePitch + arpDelta, 0x20, 0xffff);
+            pitchToMixer = dclamp(voice->basePitch + arpDelta, 0x20, 0xffff);
             voice->lastArpVoice = voiceIdx;
         }
 
@@ -598,7 +602,7 @@ void te_apply_tracker_tick(TaudEngine *e)
         voice->pitchModDelta = pitchToMixer - voice->noteVal;
 
         autoVibDelta = te_advance_auto_vibrato(e, voice);
-        finalPitch = iclamp(pitchToMixer + autoVibDelta + pitch_env_delta(voice), 0x20, 0xffff);
+        finalPitch = dclamp(pitchToMixer + autoVibDelta + pitch_env_delta(voice), 0x20, 0xffff);
         voice->playbackRate = te_compute_playback_rate(e, voice, finalPitch, e->tuningRatio);
         voice->renderPitch = finalPitch;
 
@@ -690,7 +694,8 @@ void te_apply_tracker_tick(TaudEngine *e)
     /* Background (NNA-ghost) voices: passive maintenance only. */
     for (i = e->bgCount - 1; i >= 0; i--) {
         TaudVoice *bg = e->bg[i];
-        int autoVibDelta, finalPitch;
+        int autoVibDelta;
+        double finalPitch;
         bool fadedOut;
         if (!bg->active) { te_bg_remove_at(e, i); continue; }
         if (bg->isLayerChild) {
@@ -720,7 +725,7 @@ void te_apply_tracker_tick(TaudEngine *e)
             } else {
                 bg->noteVal = bg->layerFixedNote >= 0
                     ? bg->layerFixedNote
-                    : iclamp(parent->noteVal + bg->layerRelDetune, 0x20, 0xffff);
+                    : dclamp(parent->noteVal + bg->layerRelDetune, 0x20, 0xffff);
                 bg->layerPitchMod = parent->pitchModDelta;
                 bg->basePitch = bg->noteVal;
                 bg->amigaPeriod = -1.0;
@@ -756,7 +761,7 @@ void te_apply_tracker_tick(TaudEngine *e)
         }
         bg->fadeoutMixStep = spt > 0.0 ? (bg->fadeoutVolume - bg->fadeoutMix) / spt : 0.0;
         autoVibDelta = te_advance_auto_vibrato(e, bg);
-        finalPitch = iclamp(bg->noteVal + bg->layerPitchMod + autoVibDelta + pitch_env_delta(bg), 0x20, 0xffff);
+        finalPitch = dclamp(bg->noteVal + bg->layerPitchMod + autoVibDelta + pitch_env_delta(bg), 0x20, 0xffff);
         bg->playbackRate = te_compute_playback_rate(e, bg, finalPitch, e->tuningRatio);
         bg->renderPitch = finalPitch;
         update_filter_cutoff(bg);

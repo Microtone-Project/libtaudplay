@@ -4,7 +4,7 @@
 
 #define FUNK_XFADE_SAMPLES 64
 
-double te_compute_playback_rate(const TaudEngine *e, const TaudVoice *v, int noteVal, double tuningRatio)
+double te_compute_playback_rate(const TaudEngine *e, const TaudVoice *v, double noteVal, double tuningRatio)
 {
     return ((double)v->activeSamplingRate / e->rate) *
            js_pow(2.0, (noteVal - MIDDLE_C + v->activeSampleDetune) / 4096.0) *

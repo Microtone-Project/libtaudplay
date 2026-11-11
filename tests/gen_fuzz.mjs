@@ -5,8 +5,9 @@
 // (stereo included), layered and FM metainstruments (chip operators
 // included), OPL, PSG and formant instruments (sung from a sample or from a
 // chip), table kinds the engine does not know, sample modifications,
-// interrupts, mastering, instrument mixing chains (IMix, valid and not) and
-// lyric instruments (ILyr, valid and not).
+// interrupts, mastering, instrument mixing chains (IMix, valid and not),
+// lyric instruments (ILyr, valid and not), wide-cell notes with sixteenths
+// (65536-TET) and 8-bit volume envelopes.
 //
 //   node tests/gen_fuzz.mjs <microtone-taudplay> SEED OUT.taud
 //
@@ -33,6 +34,17 @@ const lanes64 = variant === 1;
 const surround = variant === 2 ? 1 : variant === 3 ? 2 : 0;
 const fmtVer = wide ? 3 : 2;
 const numLanes = lanes64 ? ri(33, 40) : ri(4, 10);
+
+// FUZZ_REPEAT=1: every note is one of four pitches, each with its own
+// sixteenths in a wide-cell song (65536-TET), played on three sample
+// instruments whose Duplicate Check is the same-note kind — so the same pitch
+// comes round again on a lane still sounding it, and the check's same-note
+// test has something to find. $3355 + 9/16 sits just past a semitone's
+// rounding edge, where a glissando (S $1x, switched on and off in a wide
+// cell's second effect column) snaps up only if the fraction is kept.
+const denseRepeat = process.env.FUZZ_REPEAT === "1";
+const REPEAT_NOTES = [0x3355, 0x4000, 0x4abc, 0x5123];
+const REPEAT_FINE = new Map([[0x3355, 9], [0x4000, 0], [0x4abc, 8], [0x5123, 3]]);
 
 // ── sample pool ──
 const SAMPLEBIN = 8388608, INSTBIN = 262144;
@@ -106,6 +118,13 @@ for (let idx = 1; idx <= 24; idx++) {
   b[175] = chance(0.4) ? ri(0, 255) : 0;
   b[176] = chance(0.3) ? ri(0, 40) : 0;
   b[177] = ri(0, 255);
+  // Byte 14 bit 6, 8-bit volume envelopes (full volume 255, not 63), on a
+  // quarter of them: picked by a byte already drawn, the nodes widened from
+  // 0…63 to 0…255 in place, so every seed's random stream stays as it was.
+  if ((b[177] & 3) === 0) {
+    b[14] |= 0x40;
+    for (let k = 0; k < 25; k++) b[21 + 2 * k] = (b[21 + 2 * k] << 2) | (b[21 + 2 * k] >> 4);
+  }
   w16(b, 178, ri(0x3000, 0x7000));
   b[180] = chance(0.3) ? ri(0, 255) : 0;
   b[181] = chance(0.3) ? ri(0, 60) : 0;
@@ -116,6 +135,7 @@ for (let idx = 1; idx <= 24; idx++) {
   b[187] = chance(0.4) ? ri(0, 255) : 0;
   b[188] = chance(0.3) ? ri(0, 255) : 0;
   b[195] = chance(0.3) ? ri(0, 255) : 0;
+  if (denseRepeat) b[195] = (b[195] & 0xcc) | 0x01;  // type 1 (same note), the action as drawn
   b[196] = chance(0.5) ? ri(1, 255) : 0;
   b[251] = chance(0.3) ? ri(0, 255) : 0;
   b[252] = ri(0, 255); b[253] = ri(0, 255); b[254] = ri(0, 255);
@@ -142,6 +162,13 @@ function typedFields(b, s) {
   b[174] = chance(0.3) ? ri(0, 40) : 0;
   b[175] = chance(0.3) ? ri(0, 255) : 0;
   b[177] = ri(0, 255);
+  // Byte 14 bit 6, 8-bit volume envelopes (full volume 255, not 63), on a
+  // quarter of them: picked by a byte already drawn, the nodes widened from
+  // 0…63 to 0…255 in place, so every seed's random stream stays as it was.
+  if ((b[177] & 3) === 0) {
+    b[14] |= 0x40;
+    for (let k = 0; k < 25; k++) b[21 + 2 * k] = (b[21 + 2 * k] << 2) | (b[21 + 2 * k] >> 4);
+  }
   w16(b, 178, 0x5000);
   b[182] = chance(0.4) ? ri(0, 255) : 0xff;
   b[183] = ri(0, 255);
@@ -444,7 +471,7 @@ function randNote() {
   if (r < 0.07) return 3;
   if (r < 0.08) return 4;
   if (r < 0.10) return ri(0x10, 0x1f);
-  return ri(0x3000, 0x7000);
+  return denseRepeat ? pick(REPEAT_NOTES) : ri(0x3000, 0x7000);
 }
 // FUZZ_WILD=1 overwrites every OPL, PSG and formant block with random bytes
 // (for the sanitizer build: pointers, lengths and rates anywhere at all).
@@ -463,6 +490,7 @@ const instChoices = process.env.FUZZ_INSTS === "opl" ? oplInsts
   : process.env.FUZZ_INSTS === "formant" ? formantInsts
   : process.env.FUZZ_INSTS === "fm" ? [40, 41, 42, 43]
   : process.env.FUZZ_INSTS === "layered" ? [30, 31, 32, 33, 30, 31, 32, 33, ...sampleInsts]
+  : denseRepeat ? sampleInsts.slice(0, 3)
   : [...sampleInsts, 30, 31, 32, 33, 34, 35, 40, 41, 42, 43, ...oplInsts, ...oplInsts, ...psgInsts, ...psgInsts,
     ...formantInsts, ...formantInsts];
 
@@ -602,8 +630,19 @@ function makePattern() {
       const panEff = chance(0.6) ? 3 : ri(0, 2);
       p[o + 8] = ((az >>> 8) << 7) | ((chance(0.5) ? 3 : volEff) << 4) | panEff;
       p[o + 9] = ri(0, 255);
+      // Byte 13: the note's sixteenths (high nibble — a wide cell's pitch is
+      // 65536-TET) on half the cells, sentinels and empty notes included, and
+      // junk in the RESERVED low nibble. Read off bytes already drawn, so the
+      // random stream stays as it was.
+      const fine = denseRepeat && REPEAT_FINE.has(note) ? REPEAT_FINE.get(note)
+        : (p[o + 9] & 0x10) !== 0 ? p[o + 9] & 0x0f : 0;
+      p[o + 13] = (fine << 4) | (p[o + 4] & 0x0f);
       if (denseGlides && (op === 0x10 || op === 0x15) && chance(0.5)) {
         p[o + 10] = 0x1c; w16(p, o + 11, 0xd000 | (ri(1, 3) << 8));
+      } else if (denseRepeat && (p[o + 9] & 0xc0) === 0xc0) {
+        // Glissando on (S $11) on one row in eight and off (S $10) on another
+        // one in eight: it snaps the four pitches to their semitones.
+        p[o + 10] = 0x1c; w16(p, o + 11, (p[o + 9] & 0x20) !== 0 ? 0x1100 : 0x1000 | (p[o + 9] & 0xff));
       } else if (chance(0.3)) {
         if (chance(0.4)) { p[o + 10] = 0xba; w16(p, o + 11, ri(0, 0xffff)); }
         else { const [op2, a2] = pick(EFFECTS); p[o + 10] = op2; w16(p, o + 11, a2()); }

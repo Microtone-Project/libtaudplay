@@ -31,7 +31,13 @@ static void resolve_env_wrap(int loopWord, int sustainWord, bool keyOff, int ran
     }
 }
 
-static inline double vol_of(int value) { return dmin(dmax(value / 63.0, 0.0), 1.0); }
+/* A node's volume out of the voice's full scale: 63, or 255 when the
+ * instrument's byte 14 bit 6 says its envelopes are 8-bit (§7.2). Divided by
+ * the integer, never multiplied by a reciprocal, as the reference does. */
+static inline double vol_of(const TaudVoice *v, int value)
+{
+    return dmin(dmax(value / (double)v->activeVolEnvMax, 0.0), 1.0);
+}
 
 static void jump_to_sustain_end(TaudVoice *v)
 {
@@ -41,7 +47,7 @@ static void jump_to_sustain_end(TaudVoice *v)
     if (v->envIndex >= susEnd) return;
     v->envIndex = susEnd;
     v->envTimeSec = 0.0;
-    v->envVolume = vol_of(NODE(v->activeVolEnv, susEnd).value);
+    v->envVolume = vol_of(v, NODE(v->activeVolEnv, susEnd).value);
 }
 
 void te_apply_key_lift(TaudVoice *v, const TaudInst *inst)
@@ -69,20 +75,20 @@ void te_advance_envelope(TaudEngine *e, TaudVoice *v, double tickSec)
         wrapping = wStart >= 0;
 
         if (wrapping && v->envIndex == wEnd && wStart == wEnd) {
-            v->envVolume = vol_of(NODE(volEnv, v->envIndex).value);
+            v->envVolume = vol_of(v, NODE(volEnv, v->envIndex).value);
         } else if (wrapping && v->envIndex == wEnd) {
             v->envTimeSec = 0.0;
             v->envIndex = wStart;
-            v->envVolume = vol_of(NODE(volEnv, v->envIndex).value);
+            v->envVolume = vol_of(v, NODE(volEnv, v->envIndex).value);
         } else if (v->envIndex >= MAX_IDX) {
             int vEnd = NODE(volEnv, MAX_IDX).value;
-            v->envVolume = vol_of(vEnd);
+            v->envVolume = vol_of(v, vEnd);
             if (vEnd == 0 && !wrapping) te_start_ramp_out(e, v);
         } else {
             double vOffset = minifloat_to_double(NODE(volEnv, v->envIndex).offset);
             int vCurValue = NODE(volEnv, v->envIndex).value;
             if (vOffset == 0.0) {
-                v->envVolume = vol_of(vCurValue);
+                v->envVolume = vol_of(v, vCurValue);
                 if (vCurValue == 0 && !wrapping) te_start_ramp_out(e, v);
             } else {
                 v->envTimeSec += tickSec;
@@ -91,10 +97,10 @@ void te_advance_envelope(TaudEngine *e, TaudVoice *v, double tickSec)
                     v->envTimeSec -= vOffset;
                     nextIdx = wrapping && v->envIndex == wEnd ? wStart : imin(v->envIndex + 1, MAX_IDX);
                     v->envIndex = nextIdx;
-                    v->envVolume = vol_of(NODE(volEnv, v->envIndex).value);
+                    v->envVolume = vol_of(v, NODE(volEnv, v->envIndex).value);
                 } else {
-                    double cur = vol_of(vCurValue);
-                    double nxt = vol_of(NODE(volEnv, imin(v->envIndex + 1, MAX_IDX)).value);
+                    double cur = vol_of(v, vCurValue);
+                    double nxt = vol_of(v, NODE(volEnv, imin(v->envIndex + 1, MAX_IDX)).value);
                     v->envVolume = cur + (nxt - cur) * (v->envTimeSec / vOffset);
                 }
             }
