@@ -299,6 +299,10 @@ your compiler and your platform produce the engine's bits. It runs:
   `FUZZ_IMIX=0` in none, and `FUZZ_IMIX_KINDS=tsh1,expd` (any FourCCs) draws
   their equipment from those pieces alone.
   `FUZZ_LYRIC=1` gives every song lyrics, `FUZZ_LYRIC=0` none.
+  `FUZZ_IPIT=1` gives every song pitch extensions (`IPit`: base fields, Ixmp
+  patches, layer and rack tables; fractions, sixteen-octave steps out of a
+  note value's range, stale guards, groups that do not fit, a reserved flag
+  and a cut-off group), `FUZZ_IPIT=0` none.
   `FUZZ_S9=1` makes `S $9xxx` half of every effect command, on most rows;
   `FUZZ_CUTS=1` does the same for `S $70`…`S $76` (past-note actions, New Note
   Action overrides), best with `FUZZ_INSTS=layered`.

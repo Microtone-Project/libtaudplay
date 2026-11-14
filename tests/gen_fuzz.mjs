@@ -7,7 +7,8 @@
 // chip), table kinds the engine does not know, sample modifications,
 // interrupts, mastering, instrument mixing chains (IMix, valid and not),
 // lyric instruments (ILyr, valid and not), wide-cell notes with sixteenths
-// (65536-TET) and 8-bit volume envelopes.
+// (65536-TET), 8-bit volume envelopes and pitch extensions (IPit, guarded
+// and not).
 //
 //   node tests/gen_fuzz.mjs <microtone-taudplay> SEED OUT.taud
 //
@@ -388,20 +389,23 @@ for (const idx of [...sampleInsts.slice(0, 10), oplInsts[0], psgInsts[0], forman
   if (!chance(0.6)) continue;
   const n = ri(1, 3);
   const bytes = [];
+  const pitch = [];   // each patch's three pitch words, for an IPit guard
   for (let k = 0; k < n; k++) {
     const s = samples[ri(0, samples.length - 1)], s2 = samples[ri(0, samples.length - 1)];
     const len = Math.min(s.len, s2.len);
     const ls = ri(0, len - 2);
-    bytes.push(...patchRecord({
+    const pr = {
       ps: k === n - 1 ? 0 : ri(0, 0x6000), pe: 0xffff, vs: 0, ve: 63,
       ptr: s.ptr, len, play: 0, ls, le: ri(ls + 1, len), rate: pick([8363, 22050, 44100]),
       detune: ri(-500, 500), loop: ri(0, 3), pan: chance(0.5) ? 0xff : ri(0, 254), dnv: chance(0.5) ? 0 : ri(1, 255),
       vs1: 0, vs2: 0, vd: 0, vr: 0, vw: 0xff,
       extra: chance(0.5), sf: chance(0.5), fade: ri(0, 200), cut: ri(0, 0xffff), res: ri(0, 0x3ff), atten: ri(0, 255),
       vol: chance(0.3), chan: chance(0.4), chanMode: ri(0, 1), ptr2: s2.ptr,
-    }));
+    };
+    bytes.push(...patchRecord(pr));
+    pitch.push([pr.ps, pr.pe, pr.detune & 0xffff]);
   }
-  ixmp.push({ inst: idx, count: n, bytes });
+  ixmp.push({ inst: idx, count: n, bytes, pitch });
 }
 
 // ── patterns ──
@@ -794,6 +798,91 @@ if (process.env.FUZZ_LYRIC !== "0" && chance(process.env.FUZZ_LYRIC ? 1 : 0.6)) 
   }
   if (chance(0.1)) bytes.push(...[ri(0, 255), 0, ri(1, 255), 0, 0, 0]);   // truncated tail
   sec("ILyr", Uint8Array.from(bytes));
+}
+
+// ── pitch extensions (IPit, file format §9.18) ──
+// Drawn after everything else, so the rest of a seed's song is what it was
+// before them. FUZZ_IPIT=0 leaves them out, FUZZ_IPIT=1 always has them. An
+// entry gives a sample instrument its base fields (sample detune, pitch-pan
+// centre) and its Ixmp patches' ranges and detunes, an OPL instrument its
+// rhythm partner, a formant one its reference note (lyrics included), a
+// layered table or a rack its entries' detunes and ranges. A delta byte is
+// mostly a fraction (the cell's sixteenths meet the ranges' edges), now and
+// then sixteen octaves up or down (a layer or an operator out of a note
+// value's range: voice.pitchExcess). Some guards are wrong, some groups do
+// not fit the instrument (both ignored whole), a later entry for an
+// instrument replaces the earlier, and a reserved flag or a cut-off group
+// ends the read.
+if (process.env.FUZZ_IPIT !== "0" && chance(process.env.FUZZ_IPIT ? 1 : 0.5)) {
+  const crc16 = (crc, bytes) => {
+    for (const x of bytes) {
+      crc ^= x << 8;
+      for (let k = 0; k < 8; k++) crc = ((crc & 0x8000) !== 0 ? (crc << 1) ^ 0x1021 : crc << 1) & 0xffff;
+    }
+    return crc;
+  };
+  const le = (w) => [w & 0xff, (w >>> 8) & 0xff];
+  const word = (b, o) => b[o] | (b[o + 1] << 8);
+  const delta = () => (chance(0.08) ? pick([0x10, 0xf0, 0x10 | ri(0, 15), 0xf0 | ri(0, 15)]) : 0) | (chance(0.85) ? ri(0, 15) : 0);
+  const entry = (id, flags, guard, groups) => {
+    const out = [id & 0xff, flags | ((id >>> 8) & 3), ...le(guard)];
+    return out.concat(...groups);
+  };
+  const bytes = [];
+  const baseOf = (idx, kindWord) => {
+    const b = rec(idx);
+    return { crc: crc16(0xffff, [...le(word(b, 184)), ...le(word(b, 178)), ...le(kindWord)]),
+      group: [delta(), delta(), delta()] };
+  };
+  const targets = [];
+  for (const idx of sampleInsts.slice(0, 12)) if (chance(0.6)) targets.push(idx);
+  for (const idx of [...oplInsts, ...formantInsts]) if (chance(0.5)) targets.push(idx);
+  for (const idx of [30, 31, 32, 33, 40, 41, 42, 43]) if (chance(0.6)) targets.push(idx);
+  for (const idx of targets) {
+    const b = rec(idx);
+    const isTable = (idx >= 30 && idx < 34) || (idx >= 40 && idx < 44);
+    let flags = 0, crc = 0xffff;
+    const groups = [];
+    if (isTable) {
+      // The entries the engine reads: the count byte's, a rack's at most 16,
+      // as many as fit the record.
+      let n = b[1];
+      if (idx >= 40) n = Math.min(n, 16);
+      n = Math.min(n, Math.floor((256 - 4) / 10));
+      const raw = [];
+      for (let k = 0; k < n; k++) raw.push(...b.subarray(4 + k * 10 + 2, 4 + k * 10 + 8));
+      crc = crc16(crc, raw);
+      flags |= 0x08;
+      const tn = chance(0.05) ? n + 1 : n;   // a count that does not fit: ignored
+      const g = [tn];
+      for (let k = 0; k < tn; k++) g.push(delta(), delta(), delta());
+      groups.push(g);
+    } else {
+      const kindWord = oplInsts.includes(idx) ? word(b, 197 + 4) : formantInsts.includes(idx) ? word(b, 197 + 7) : 0;
+      if (!ixmp.some((e) => e.inst === idx) || chance(0.6)) {
+        const base = baseOf(idx, kindWord);
+        crc = base.crc;
+        flags |= 0x04;
+        groups.push(base.group);
+      }
+      const ix = ixmp.find((e) => e.inst === idx);
+      if (ix && chance(0.8)) {
+        for (const [ps, pe, det] of ix.pitch) crc = crc16(crc, [...le(ps), ...le(pe), ...le(det)]);
+        flags |= 0x10;
+        const pn = chance(0.05) ? ix.count + 1 : ix.count;
+        const g = [pn & 0xff, pn >>> 8];
+        for (let k = 0; k < pn; k++) g.push(delta(), delta(), delta());
+        groups.push(g);
+      }
+    }
+    if (flags === 0) continue;
+    if (chance(0.12)) crc ^= 1 << ri(0, 15);   // a stale guard
+    bytes.push(...entry(idx, flags, crc, groups));
+  }
+  if (chance(0.15) && bytes.length) bytes.push(...entry(pick(sampleInsts), 0x04, 0, [[1, 2, 3]]));   // replaces, guard wrong
+  if (chance(0.08)) bytes.push(...entry(pick(sampleInsts), 0x24, 0, [[0, 0, 0]]));   // reserved flag: the read ends
+  if (chance(0.08)) bytes.push(...entry(pick(sampleInsts), 0x10, 0, [[5, 0, 1, 2]]));   // a group cut off
+  sec("IPit", Uint8Array.from(bytes));
 }
 const projHeader = new Uint8Array(16);
 projHeader.set([0x1e, 0x54, 0x61, 0x75, 0x64, 0x50, 0x72, 0x4a]);
