@@ -341,7 +341,7 @@ library does not compile: `wasm_api.c` (the calls a browser host makes —
 uploads, jam voices, meters), `snapshot.c` (the state block the tracker's
 display reads) and `wasm_parts.c` (hooks for the tracker's tests).
 
-In step with taudplay 5.0.0 (Microtone.js 5.0.0, engine 74c9468d1933).
+In step with taudplay 5.0.3 (Microtone.js 5.0.3, engine 02a24a9e89d1).
 
 ## Licence
 
