@@ -2,6 +2,9 @@
  * the stereo fold renderer, the per-voice position model, the Z slide, and the
  * object bus the binaural monitor decodes). */
 
+#include <stdlib.h>
+#include <string.h>
+
 #include "taud_internal.h"
 
 #define PI 3.141592653589793
@@ -40,7 +43,7 @@ void te_angles_from_direction(double x, double y, double z, double out[2])
 }
 
 /* ITU placement of a sample's channels as azimuth offsets (stereo = ±30°). */
-static double sample_channel_layout(int chans, int k)
+double te_sample_channel_layout(int chans, int k)
 {
     if (chans == 2) return (k == 0 ? -30 : 30) * AZ_PER_DEG;
     return 0 * AZ_PER_DEG;
@@ -175,10 +178,152 @@ static void stereo_channel_gains(double az, double el, double *out, int off)
     out[off + 1] = js_sin((PI * pan) / 512.0);
 }
 
+/* speakers.js SpeakerRenderer.channelGains: pairwise equal-power panning
+ * round the ring of non-LFE speakers; height has nowhere to go in a planar
+ * layout, so it is spread over the ring instead. */
+static void speaker_channel_gains(const TaudSpatialBus *bus, double az, double el, double *out, int off)
+{
+    int n = bus->spkCount, size = bus->ringSize, c, k, i, j;
+    double a = te_wrap_azimuth(az), a0, span, d, t, w;
+    for (c = 0; c < n; c++) out[off + c] = 0.0;
+    /* The bracketing pair, with the wrap-around arc as the last segment. */
+    i = size - 1;
+    for (k = 0; k < size; k++) {
+        if (a < bus->ringAz[k]) { i = (k - 1 + size) % size; break; }
+    }
+    j = (i + 1) % size;
+    a0 = bus->ringAz[i];
+    span = bus->ringAz[j] - a0;
+    if (span <= 0) span += AZIMUTH_TURN;
+    d = a - a0;
+    if (d < 0) d += AZIMUTH_TURN;
+    t = (d / span) * (PI / 2);
+    out[off + bus->ringChannel[i]] = js_cos(t);
+    out[off + bus->ringChannel[j]] = js_sin(t);
+    w = fabs(js_sin(el * (PI / 256)));
+    if (w > 0) {
+        double diffuse = w / size;
+        for (k = 0; k < size; k++) {
+            c = off + bus->ringChannel[k];
+            out[c] = sqrt((1 - w) * out[c] * out[c] + diffuse);
+        }
+    }
+}
+
 static void bus_channel_gains(const TaudSpatialBus *bus, double az, double el, double *out, int off)
 {
-    if (bus->kind == 1) te_binaural_channel_gains(bus->bin, az, el, out, off);
+    if (bus->kind == RENDER_BINAURAL) te_binaural_channel_gains(bus->bin, az, el, out, off);
+    else if (bus->kind == RENDER_ANALYSIS) {
+        /* The master strip's analysis target: the scope harmonics, then the feeds. */
+        te_encode_sn3d(az, el, 2, out + off);
+        if (bus->spkCount > 0) speaker_channel_gains(bus, az, el, out, off + SCOPE_CHANNELS);
+    } else if (bus->kind == RENDER_AMBISONIC) {
+        /* spatial.js AmbisonicRenderer: the harmonics its channel list keeps. */
+        double sh[16];
+        int c;
+        te_encode_sn3d(az, el, bus->order, sh);
+        for (c = 0; c < bus->numChannels; c++) out[off + c] = sh[bus->acn[c]];
+    } else if (bus->kind == RENDER_SPEAKERS) {
+        speaker_channel_gains(bus, az, el, out, off);
+    }
     else stereo_channel_gains(az, el, out, off);
+}
+
+/* The speaker layouts' directions, in degrees clockwise from front; LFE marks
+ * the channel that takes no positioned sound (speakers.js SPEAKER_LAYOUTS). */
+#define SPK_LFE 1000
+static const int SPEAKER_DEG[3][SPEAKER_MAX] = {
+    { -30, 30, -110, 110, 0, 0, 0, 0 },                    /* quad */
+    { -30, 30, 0, SPK_LFE, -110, 110, 0, 0 },              /* 5.1 */
+    { -30, 30, 0, SPK_LFE, -135, 135, -90, 90 },           /* 7.1 */
+};
+static const int SPEAKER_COUNT[3] = { 4, 6, 8 };
+
+/* Give `bus` speaker layout 1 quad / 2 5.1 / 3 7.1: the ring, and each
+ * speaker's own stereo fold for a monitor. */
+static void speaker_layout(TaudSpatialBus *bus, int layout)
+{
+    const int *deg = SPEAKER_DEG[layout - 1];
+    int n = SPEAKER_COUNT[layout - 1], i, k, size = 0;
+    bus->spkCount = n;
+    memset(bus->monitorGains, 0, sizeof bus->monitorGains);
+    for (i = 0; i < n; i++) {
+        double az;
+        if (deg[i] == SPK_LFE) continue;
+        az = te_wrap_azimuth(128 + deg[i] * (AZIMUTH_TURN / 360.0));
+        stereo_channel_gains(az, 0, bus->monitorGains, i * 2);
+        /* Sorted by azimuth as it goes in (no two speakers share one). */
+        for (k = size; k > 0 && bus->ringAz[k - 1] > az; k--) {
+            bus->ringAz[k] = bus->ringAz[k - 1];
+            bus->ringChannel[k] = bus->ringChannel[k - 1];
+        }
+        bus->ringAz[k] = az;
+        bus->ringChannel[k] = i;
+        size++;
+    }
+    bus->ringSize = size;
+}
+
+/* The master strip's analysis target as a bus: the nine scope harmonics, then
+ * a speaker layout's feeds (layout 1…3; 0 = the harmonics alone). */
+TaudSpatialBus *te_analysis_bus_new(int layout)
+{
+    TaudSpatialBus *bus;
+    if (layout < 0 || layout > 3) return NULL;
+    bus = (TaudSpatialBus *)calloc(1, sizeof *bus);
+    if (bus == NULL) return NULL;
+    bus->kind = RENDER_ANALYSIS;
+    if (layout >= 1) speaker_layout(bus, layout);
+    bus->numChannels = SCOPE_CHANNELS + bus->spkCount;
+    return bus;
+}
+
+void te_set_analysis_bus(TaudEngine *e, int layout)
+{
+    free(e->analysisBus);
+    e->analysisBus = NULL;
+    e->analysisGen++;
+    if (layout < 0 || layout > 3) return;
+    e->analysisBus = te_analysis_bus_new(layout);
+    if (e->analysisBus == NULL) e->oom = true;
+}
+
+/* A source at (az, el)'s gain into each of a bus's channels. */
+void te_bus_channel_gains(const TaudSpatialBus *bus, double az, double el, double *out, int off)
+{
+    bus_channel_gains(bus, az, el, out, off);
+}
+
+bool te_spatial_bus_configure(TaudSpatialBus *bus, int kind, int order, bool planar, int layout)
+{
+    if (kind == RENDER_AMBISONIC) {
+        int l, m, n = 0;
+        if (order < 0) order = 0;
+        if (order > 3) order = 3;
+        /* acnChannelList: a planar target keeps the horizontal (|m| = l) set. */
+        for (l = 0; l <= order; l++) {
+            for (m = -l; m <= l; m++) {
+                if (!planar || (m < 0 ? -m : m) == l) bus->acn[n++] = l * l + l + m;
+            }
+        }
+        bus->kind = kind;
+        bus->order = order;
+        bus->numChannels = n;
+        return true;
+    }
+    if (kind == RENDER_SPEAKERS) {
+        if (layout < 1 || layout > 3) return false;
+        speaker_layout(bus, layout);
+        bus->kind = kind;
+        bus->numChannels = bus->spkCount;
+        return true;
+    }
+    if (kind == RENDER_STEREO) {
+        bus->kind = kind;
+        bus->numChannels = 2;
+        return true;
+    }
+    return false;
 }
 
 void te_spatial_bus_add_source(TaudSpatialBus *bus, int n, double value, const double *gains, int off, double ramp)
@@ -189,8 +334,25 @@ void te_spatial_bus_add_source(TaudSpatialBus *bus, int n, double value, const d
 
 void te_spatial_bus_stereo_at(TaudSpatialBus *bus, int n, double out[2])
 {
-    if (bus->kind == 1) {
+    if (bus->kind == RENDER_BINAURAL) {
         te_binaural_monitor_stereo(bus->bin, bus->data, TRACKER_CHUNK, n, out);
+    } else if (bus->kind == RENDER_AMBISONIC) {
+        /* Coincident cardioid pair at ±90° — W ± Y (ACN 1 is channel 1 in
+         * both bases). */
+        double w = bus->data[n], y = bus->data[TRACKER_CHUNK + n];
+        out[0] = 0.5 * (w + y);
+        out[1] = 0.5 * (w - y);
+    } else if (bus->kind == RENDER_SPEAKERS) {
+        /* Each speaker folded as if it were itself a source. */
+        double l = 0.0, r = 0.0;
+        int c;
+        for (c = 0; c < bus->numChannels; c++) {
+            double v = bus->data[c * TRACKER_CHUNK + n];
+            l += v * bus->monitorGains[c * 2];
+            r += v * bus->monitorGains[c * 2 + 1];
+        }
+        out[0] = l;
+        out[1] = r;
     } else {
         out[0] = bus->data[n];
         out[1] = bus->data[TRACKER_CHUNK + n];
@@ -314,25 +476,70 @@ double te_display_pan_byte(TaudEngine *e, int vi, const TaudVoice *v)
     return wsum > 1e-9 ? sum / wsum : te_voice_pan_byte(v);
 }
 
-/* Renderer gains for every channel of `v`, cached until the source moves. */
+/* …and the same for a surround song, as [azimuth, elevation]: the layers'
+ * DIRECTIONS averaged, so two either side of front average to front rather
+ * than to the back of the room (displayAngles). */
+void te_display_angles(TaudEngine *e, int vi, const TaudVoice *v, double out[2])
+{
+    double x = 0.0, y = 0.0, z = 0.0, wsum = 0.0, w, d[3], len;
+    int i;
+    w = display_weight(v);
+    te_direction_from_angles(te_voice_azimuth(v), te_voice_elevation(v), d);
+    x += d[0] * w; y += d[1] * w; z += d[2] * w;
+    wsum += w;
+    if (v->metaForeground) {
+        for (i = 0; i < e->bgCount; i++) {
+            const TaudVoice *bg = e->bg[i];
+            if (!bg->active || !te_is_sounding_child(e, bg, vi)) continue;
+            w = display_weight(bg);
+            te_direction_from_angles(te_voice_azimuth(bg), te_voice_elevation(bg), d);
+            x += d[0] * w; y += d[1] * w; z += d[2] * w;
+            wsum += w;
+        }
+    }
+    /* Weightless, or layers exactly opposite each other: neither has a mean
+     * direction, so the foreground voice speaks for the note. */
+    len = sqrt(x * x + y * y + z * z);
+    if (wsum <= 1e-9 || len < 1e-6) {
+        out[0] = te_voice_azimuth(v);
+        out[1] = te_voice_elevation(v);
+        return;
+    }
+    te_angles_from_direction(x / len, y / len, z / len, out);
+}
+
+/* Renderer gains for every channel of `v` on `bus`, cached in `sc` until the
+ * source moves or the bus's render target does (`gen`). Each bus needs a cache
+ * of its own: two alternating on one would invalidate each other every sample. */
+static const double *voice_gains_cache(TaudSpatialBus *bus, TaudSpatialCache *sc, unsigned gen, TaudVoice *v);
+
 const double *te_spatial_voice_gains(TaudEngine *e, TaudVoice *v)
 {
-    TaudSpatialBus *bus = e->spatial;
-    TaudSpatialCache *sc = &v->spatial;
+    return voice_gains_cache(e->spatial, &v->spatial, e->rendererGen, v);
+}
+
+/* …and for the master strip's analysis bus. */
+const double *te_analysis_voice_gains(TaudEngine *e, TaudVoice *v)
+{
+    return voice_gains_cache(e->analysisBus, &v->analysisSpatial, e->analysisGen, v);
+}
+
+static const double *voice_gains_cache(TaudSpatialBus *bus, TaudSpatialCache *sc, unsigned gen, TaudVoice *v)
+{
     int nc = bus->numChannels;
     int chans = v->activeChanCount == 2 ? 2 : 1;
     double az = v->currentPan;
     /* …and the ramped elevation (te_advance_elev_ramp), for the same reason. */
     double el = isnan(v->elevCur) ? te_voice_elevation(v) : v->elevCur;
-    if (!sc->valid || sc->az != az || sc->el != el || sc->chans != chans || sc->rendererGen != e->rendererGen) {
+    if (!sc->valid || sc->az != az || sc->el != el || sc->chans != chans || sc->rendererGen != gen) {
         int k;
         for (k = 0; k < chans; k++) {
             double ang[2];
-            te_sample_channel_angles(az, el, sample_channel_layout(chans, k), ang);
+            te_sample_channel_angles(az, el, te_sample_channel_layout(chans, k), ang);
             bus_channel_gains(bus, ang[0], ang[1], sc->gains, k * nc);
         }
         sc->valid = true;
-        sc->az = az; sc->el = el; sc->chans = chans; sc->rendererGen = e->rendererGen;
+        sc->az = az; sc->el = el; sc->chans = chans; sc->rendererGen = gen;
     }
     return sc->gains;
 }

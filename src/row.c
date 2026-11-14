@@ -125,7 +125,7 @@ static void apply_instrument_change(TaudEngine *e, TaudVoice *v, const TaudInst 
     }
 }
 
-static int cue_row_limit(const TaudCue *c)
+int te_cue_row_limit(const TaudCue *c)
 {
     int a = c->inst0.type == INST_PATLEN || c->inst0.type == INST_HALTAT ? c->inst0.rows : 64;
     int b = c->inst1.type == INST_PATLEN || c->inst1.type == INST_HALTAT ? c->inst1.rows : 64;
@@ -171,7 +171,7 @@ void te_apply_tracker_row(TaudEngine *e)
             int length = (rawRow->effectArg >> 8) & 0xff;
             int repeats = rawRow->effectArg & 0xff;
             if (length > 0 && repeats > 0 && length <= n) {
-                int patLen = cue_row_limit(cue);
+                int patLen = te_cue_row_limit(cue);
                 voice->dittoSourceStart = n - length;
                 voice->dittoLength = length;
                 voice->dittoEndRow = imin(n + length * repeats - 1, patLen - 1);
@@ -198,6 +198,7 @@ void te_apply_tracker_row(TaudEngine *e)
             /* The note travels whole: its word and its sixteenths. */
             dittoRow.note = rawRow->note != 0 ? rawRow->note : src->note;
             dittoRow.noteFine = rawRow->note != 0 ? rawRow->noteFine : src->noteFine;
+            dittoRow.noteFrac = rawRow->note != 0 ? rawRow->noteFrac : src->noteFrac;
             dittoRow.instrment = rawRow->instrment != 0 ? rawRow->instrment : src->instrment;
             dittoRow.volume = volIsSet ? rawRow->volume : src->volume;
             dittoRow.volumeEff = volIsSet ? rawRow->volumeEff : src->volumeEff;
@@ -251,7 +252,7 @@ void te_apply_tracker_row(TaudEngine *e)
                 int trigVol = row->volumeEff == 0 ? row->volume : -1;
                 te_apply_duplicate_check(e, vi, row->instrment, voice->noteVal);
                 te_maybe_spawn_background_for_nna(e, voice, vi, row->instrment);
-                te_trigger_meta_or_note(e, voice, vi, voice->noteVal, row->instrment, trigVol, false);
+                te_trigger_meta_or_note(e, voice, vi, voice->noteVal, row->instrment, trigVol, true, false);
             } else if (row->instrment != 0 && !inst_is_meta(&e->instruments[row->instrment])) {
                 const TaudInst *newInst;
                 const TaudPatch *newPatch;
@@ -321,7 +322,7 @@ void te_apply_tracker_row(TaudEngine *e)
                 te_maybe_spawn_background_for_nna(e, voice, vi, row->instrment);
                 /* toneG here = a G/L on a silent lane: it triggers, but as a
                  * glide (a lyric instrument's syllable, trigger.c lyric_trigger). */
-                te_trigger_meta_or_note(e, voice, vi, note, row->instrment, trigVol, toneG);
+                te_trigger_meta_or_note(e, voice, vi, note, row->instrment, trigVol, true, toneG);
                 schedule_dxny_action(voice, sArg, sDelayTick);
             }
         }
@@ -376,7 +377,7 @@ static void advance_tracker_cue(TaudEngine *e)
 void te_reconstruct_ditto_state(TaudEngine *e, int startRow)
 {
     const TaudCue *cue = te_cue_at(e, e->cuePos);
-    int patLen = cue_row_limit(cue);
+    int patLen = te_cue_row_limit(cue);
     int limit = imin(startRow, patLen);
     int channels = te_channel_count(e), vi, n;
     for (vi = 0; vi < channels; vi++) {
@@ -406,10 +407,10 @@ void te_reconstruct_ditto_state(TaudEngine *e, int startRow)
     }
 }
 
-static void reset_pattern_loop_state(TaudEngine *e)
+void te_reset_pattern_loop_state(TaudEngine *e)
 {
     int i;
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < TOTAL_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
         v->loopStartRow = 0;
         v->loopCount = 0;
@@ -452,19 +453,19 @@ void te_advance_row_position(TaudEngine *e)
         e->cuePos = imin(pendingB, NUM_CUES - 1);
         e->rowIndex = pendingC >= 0 ? pendingC : 0;
         e->position = e->cuePos;
-        reset_pattern_loop_state(e);
+        te_reset_pattern_loop_state(e);
     } else if (pendingC >= 0 && pendingLocal) {
         e->rowIndex = iclamp(pendingC, 0, 63);
     } else if (pendingC >= 0) {
         advance_tracker_cue(e);
         e->rowIndex = iclamp(pendingC, 0, 63);
-        reset_pattern_loop_state(e);
+        te_reset_pattern_loop_state(e);
     } else {
         e->rowIndex++;
-        if (e->rowIndex >= cue_row_limit(te_cue_at(e, e->cuePos))) {
+        if (e->rowIndex >= te_cue_row_limit(te_cue_at(e, e->cuePos))) {
             e->rowIndex = 0;
             advance_tracker_cue(e);
-            reset_pattern_loop_state(e);
+            te_reset_pattern_loop_state(e);
         }
     }
 }

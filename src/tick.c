@@ -55,7 +55,7 @@ int te_funk_walk_pointer(TaudEngine *e, int funkMode, int walk, int loopStart, i
 static void arm_mod_xfade(TaudEngine *e, int instId)
 {
     int i;
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < TOTAL_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
         if (v->active && v->instrumentId == instId) v->modXfade = MOD_XFADE_SAMPLES;
     }
@@ -71,7 +71,7 @@ static void arm_mod_xfade(TaudEngine *e, int instId)
 void te_psg_quarter_pass(TaudEngine *e)
 {
     int i;
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < TOTAL_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
         if (v->psg != NULL && v->active) te_psg_quarter_tick(v->psg);
     }
@@ -86,7 +86,7 @@ bool te_psg_live(const TaudEngine *e)
 {
     int i;
     if (!e->hasPsg) return false;
-    for (i = 0; i < MAX_VOICES; i++) if (e->voices[i].psg != NULL && e->voices[i].active) return true;
+    for (i = 0; i < TOTAL_VOICES; i++) if (e->voices[i].psg != NULL && e->voices[i].active) return true;
     for (i = 0; i < e->bgCount; i++) if (e->bg[i]->psg != NULL && e->bg[i]->active) return true;
     return false;
 }
@@ -388,7 +388,7 @@ static int pitch_env_delta(const TaudVoice *v)
 void te_apply_tick_events(TaudEngine *e)
 {
     int vi;
-    for (vi = 0; vi < MAX_VOICES; vi++) {
+    for (vi = 0; vi < TOTAL_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
         if (voice->cutAtTick != e->tickInRow && voice->noteDelayTick != e->tickInRow &&
             voice->noteActionTick != e->tickInRow) continue;
@@ -427,7 +427,7 @@ void te_apply_tick_events(TaudEngine *e)
                 te_apply_duplicate_check(e, vi, voice->delayedInst, voice->delayedNote);
                 te_maybe_spawn_background_for_nna(e, voice, vi, voice->delayedInst);
                 te_trigger_meta_or_note(e, voice, vi, voice->delayedNote, voice->delayedInst, voice->delayedVol,
-                                        voice->delayedGlide);
+                                        true, voice->delayedGlide);
                 break;
             }
             voice->noteDelayTick = -1;
@@ -446,7 +446,7 @@ void te_apply_tracker_tick(TaudEngine *e)
     double spt = e->rate * tickSec;
     int vi, i;
 
-    for (vi = 0; vi < MAX_VOICES; vi++) {
+    for (vi = 0; vi < TOTAL_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
         double pitchToMixer, finalPitch;
         int autoVibDelta;
@@ -627,7 +627,7 @@ void te_apply_tracker_tick(TaudEngine *e)
     }
 
     /* Tempo slide — once per tick at the playhead level. */
-    for (vi = 0; vi < MAX_VOICES; vi++) {
+    for (vi = 0; vi < TOTAL_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
         if (voice->tempoSlideDir != 0 && e->tickInRow > 0) {
             int tempoByte = iclamp(e->bpm - 0x19 + voice->tempoSlideDir * voice->tempoSlideAmount, 0, 0xff);
@@ -637,7 +637,7 @@ void te_apply_tracker_tick(TaudEngine *e)
 
     /* Global volume slide (W coarse). */
     if (e->tickInRow > 0) {
-        for (vi = 0; vi < MAX_VOICES; vi++) {
+        for (vi = 0; vi < TOTAL_VOICES; vi++) {
             TaudVoice *voice = &e->voices[vi];
             if (voice->wSlideDir != 0) {
                 e->globalVolume = iclamp(e->globalVolume + voice->wSlideDir * voice->wSlideAmount, 0, 0xff);
@@ -651,7 +651,7 @@ void te_apply_tracker_tick(TaudEngine *e)
     te_psg_quarter_pass(e);
 
     /* Invert loop (S $F0xx). */
-    for (vi = 0; vi < MAX_VOICES; vi++) {
+    for (vi = 0; vi < TOTAL_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
         TaudInst *inst;
         if (voice->invertSpeed == 0 || !voice->active) continue;
@@ -667,7 +667,7 @@ void te_apply_tracker_tick(TaudEngine *e)
     }
 
     /* Funk repeat (Z $Ffxx). */
-    for (vi = 0; vi < MAX_VOICES; vi++) {
+    for (vi = 0; vi < TOTAL_VOICES; vi++) {
         TaudVoice *voice = &e->voices[vi];
         int mode, loopStart, loopLen, sampleLen;
         if (voice->funkSpeed == 0 || !voice->active) continue;
@@ -686,7 +686,7 @@ void te_apply_tracker_tick(TaudEngine *e)
     }
 
     /* Sample modification (notefx 2 / 3), lane-clocked. */
-    for (vi = 0; vi < MAX_VOICES; vi++) advance_sample_mod(e, &e->voices[vi]);
+    for (vi = 0; vi < TOTAL_VOICES; vi++) advance_sample_mod(e, &e->voices[vi]);
     for (i = 0; i < e->bgCount; i++) {
         if (e->bg[i]->isLayerChild) advance_sample_mod(e, e->bg[i]);
     }
@@ -701,7 +701,7 @@ void te_apply_tracker_tick(TaudEngine *e)
         if (bg->isLayerChild) {
             TaudVoice *parent = bg->fmOperator
                 ? bg->fmParent
-                : (bg->sourceChannel >= 0 && bg->sourceChannel < MAX_VOICES ? &e->voices[bg->sourceChannel] : NULL);
+                : (bg->sourceChannel >= 0 && bg->sourceChannel < TOTAL_VOICES ? &e->voices[bg->sourceChannel] : NULL);
             if (bg->fmOperator && (parent == NULL || !parent->active ||
                 parent->fmRig == NULL || parent->fmRig->voices[0] != parent)) {
                 bg->active = false;
@@ -723,9 +723,16 @@ void te_apply_tracker_tick(TaudEngine *e)
                 bg->layerPitchMod = 0;
                 bg->layerFixedNote = -1;
             } else {
-                bg->noteVal = bg->layerFixedNote >= 0
-                    ? bg->layerFixedNote
-                    : dclamp(parent->noteVal + bg->layerRelDetune, 0x20, 0xffff);
+                if (bg->layerFixedNote >= 0) {
+                    bg->noteVal = bg->layerFixedNote; /* its excess is the trigger's */
+                } else {
+                    /* The parent's pitch, whole, plus this entry's place
+                     * against it; what a note value cannot hold goes into
+                     * the excess, as at the trigger. */
+                    double full = parent->noteVal + parent->pitchExcess + bg->layerRelDetune;
+                    bg->noteVal = dclamp(full, 0x20, 0xffff);
+                    bg->pitchExcess = full - bg->noteVal;
+                }
                 bg->layerPitchMod = parent->pitchModDelta;
                 bg->basePitch = bg->noteVal;
                 bg->amigaPeriod = -1.0;

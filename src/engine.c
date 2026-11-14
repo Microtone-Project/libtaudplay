@@ -144,8 +144,8 @@ static void pool_collect(TaudEngine *e)
     TaudVoiceChunk *c;
     int i;
     for (c = e->chunks; c != NULL; c = c->next) for (i = 0; i < c->count; i++) c->voices[i].marked = false;
-    for (i = 0; i < MAX_VOICES; i++) e->voices[i].marked = false;
-    for (i = 0; i < MAX_VOICES; i++) mark_voice(&e->voices[i]);
+    for (i = 0; i < TOTAL_VOICES; i++) e->voices[i].marked = false;
+    for (i = 0; i < TOTAL_VOICES; i++) mark_voice(&e->voices[i]);
     for (i = 0; i < e->bgCount; i++) mark_voice(e->bg[i]);
     e->freeList = NULL;
     for (c = e->chunks; c != NULL; c = c->next) {
@@ -204,6 +204,114 @@ void te_bg_remove_at(TaudEngine *e, int i)
     e->bgCount--;
 }
 
+/* ── retired instrument data ──
+ *
+ * A host re-uploads an instrument while its notes are sounding: the record's
+ * decoded objects (a metainstrument's table, a chip patch, the Ixmp patches a
+ * voice's envelopes point into, a lyric instrument's syllables) are replaced
+ * under voices that go on reading the old ones. The JavaScript engine has a
+ * garbage collector for exactly this; here the replaced block is RETIRED and
+ * freed once nothing can reach it.
+ *
+ * "Can reach" is decided conservatively, as a collector without type
+ * information decides it: a block is live while any pointer-sized word of a
+ * voice — every lane and jam voice, sounding or not, every background voice
+ * and whatever those reach through an FM rack — holds an address inside it,
+ * or while a live retired block does. An integer that happens to look like an
+ * address only delays a free. */
+
+struct TaudRetired { void *ptr; size_t size; bool live; };
+
+#define RETIRE_SWEEP_COUNT 64
+#define RETIRE_SWEEP_BYTES ((size_t)1 << 20)
+
+void te_retire(TaudEngine *e, void *p, size_t size)
+{
+    if (p == NULL) return;
+    if (e == NULL) { free(p); return; }
+    if (e->retiredCount == e->retiredCap) {
+        int nc = e->retiredCap ? e->retiredCap * 2 : 64;
+        struct TaudRetired *nl = (struct TaudRetired *)realloc(e->retired, sizeof *nl * (size_t)nc);
+        /* Out of memory for the list itself: the block is leaked rather than
+         * freed under a voice. */
+        if (nl == NULL) { e->oom = true; return; }
+        e->retired = nl;
+        e->retiredCap = nc;
+    }
+    e->retired[e->retiredCount].ptr = p;
+    e->retired[e->retiredCount].size = size > 0 ? size : 1;
+    e->retired[e->retiredCount].live = false;
+    e->retiredCount++;
+    e->retiredBytes += size;
+    if (e->retiredCount >= e->retireSweepAt || e->retiredBytes >= RETIRE_SWEEP_BYTES) te_retire_sweep(e);
+}
+
+/* Mark every retired block some word of [base, base + size) points into;
+ * returns how many were newly marked. */
+static int retire_scan(TaudEngine *e, const void *base, size_t size, uintptr_t lo, uintptr_t hi)
+{
+    const unsigned char *b = (const unsigned char *)base;
+    size_t n = size / sizeof(uintptr_t), i;
+    int marked = 0, k;
+    for (i = 0; i < n; i++) {
+        uintptr_t w;
+        memcpy(&w, b + i * sizeof w, sizeof w);
+        if (w < lo || w >= hi) continue;
+        for (k = 0; k < e->retiredCount; k++) {
+            struct TaudRetired *r = &e->retired[k];
+            if (!r->live && w >= (uintptr_t)r->ptr && w < (uintptr_t)r->ptr + r->size) { r->live = true; marked++; }
+        }
+    }
+    return marked;
+}
+
+void te_retire_sweep(TaudEngine *e)
+{
+    uintptr_t lo = UINTPTR_MAX, hi = 0;
+    TaudVoiceChunk *c;
+    int i, k, kept = 0;
+    size_t bytes = 0;
+    bool again;
+    if (e->retiredCount == 0) return;
+    for (k = 0; k < e->retiredCount; k++) {
+        uintptr_t a = (uintptr_t)e->retired[k].ptr;
+        if (a < lo) lo = a;
+        if (a + e->retired[k].size > hi) hi = a + e->retired[k].size;
+        e->retired[k].live = false;
+    }
+    /* Roots: the lanes and the jam bank, then every pooled voice the lanes
+     * and the background list can still reach (pool_collect's marking). */
+    for (i = 0; i < TOTAL_VOICES; i++) retire_scan(e, &e->voices[i], sizeof(TaudVoice), lo, hi);
+    for (c = e->chunks; c != NULL; c = c->next) for (i = 0; i < c->count; i++) c->voices[i].marked = false;
+    for (i = 0; i < TOTAL_VOICES; i++) e->voices[i].marked = false;
+    for (i = 0; i < TOTAL_VOICES; i++) mark_voice(&e->voices[i]);
+    for (i = 0; i < e->bgCount; i++) mark_voice(e->bg[i]);
+    for (c = e->chunks; c != NULL; c = c->next) {
+        for (i = 0; i < c->count; i++) {
+            if (c->voices[i].marked) retire_scan(e, &c->voices[i], sizeof(TaudVoice), lo, hi);
+        }
+    }
+    /* …and what a live block itself points at (a syllable patch names the
+     * patch it was made from). */
+    do {
+        again = false;
+        for (k = 0; k < e->retiredCount; k++) {
+            struct TaudRetired *r = &e->retired[k];
+            if (r->live && retire_scan(e, r->ptr, r->size, lo, hi) > 0) again = true;
+        }
+    } while (again);
+    for (k = 0; k < e->retiredCount; k++) {
+        struct TaudRetired *r = &e->retired[k];
+        if (r->live) { bytes += r->size; e->retired[kept++] = *r; }
+        else free(r->ptr);
+    }
+    e->retiredCount = kept;
+    e->retiredBytes = bytes;
+    /* What stayed is held by voices; look again only once as much has been
+     * retired on top of it. */
+    e->retireSweepAt = kept * 2 > RETIRE_SWEEP_COUNT ? kept * 2 : RETIRE_SWEEP_COUNT;
+}
+
 /* ── patterns and cues ── */
 
 const TaudCell *te_pattern_read(const TaudEngine *e, int idx)
@@ -249,8 +357,10 @@ static TaudCell *pattern_for(TaudEngine *e, int idx)
 static void cell_set_byte(TaudCell *c, int o, int b)
 {
     switch (o) {
-    case 0: c->note = (c->note & 0xff00) | b; break;
-    case 1: c->note = (c->note & 0x00ff) | (b << 8); break;
+    /* The 8-byte cell has no room for a fraction: writing a note byte drops
+     * whatever sixteenths the cell carried (TaudPlayData.setByte's `&`). */
+    case 0: c->note = (c->note & 0xff00) | b; c->noteFrac = 0; break;
+    case 1: c->note = (c->note & 0x00ff) | (b << 8); c->noteFrac = 0; break;
     case 2: c->instrment = b; break;
     case 3: c->volume = b & 63; c->volumeEff = (b >> 6) & 3; break;
     case 4: c->pan = b & 63; c->panEff = (b >> 6) & 3; break;
@@ -264,8 +374,10 @@ static void cell_set_byte(TaudCell *c, int o, int b)
 static void cell_set_byte_wide(TaudCell *c, int o, int b)
 {
     switch (o) {
-    case 0: c->note = (c->note & 0xff00) | b; break;
-    case 1: c->note = (c->note & 0x00ff) | (b << 8); break;
+    /* _setWideNote: the word takes the fine nibble last decoded — none under
+     * a sentinel (§5.5: the nibble is RESERVED there). */
+    case 0: c->note = (c->note & 0xff00) | b; c->noteFrac = c->note >= 0x20 ? c->noteFine : 0; break;
+    case 1: c->note = (c->note & 0x00ff) | (b << 8); c->noteFrac = c->note >= 0x20 ? c->noteFine : 0; break;
     case 2: c->instrment = b; break;
     case 3: c->volume = b & 0xff; break;
     case 4: c->azimuth = (c->azimuth & 0x100) | b; break;
@@ -281,7 +393,10 @@ static void cell_set_byte_wide(TaudCell *c, int o, int b)
     case 10: c->effect2 = b; break;
     case 11: c->effectArg2 = (c->effectArg2 & 0xff00) | b; break;
     case 12: c->effectArg2 = (c->effectArg2 & 0x00ff) | (b << 8); break;
-    case 13: c->noteFine = (uint8_t)(b >> 4); break; /* low nibble RESERVED */
+    case 13: /* low nibble RESERVED */
+        c->noteFine = (uint8_t)(b >> 4);
+        c->noteFrac = c->note >= 0x20 ? c->noteFine : 0;
+        break;
     default: break;
     }
 }
@@ -299,7 +414,7 @@ static void decode_pattern(const TaudEngine *e, TaudCell *pat, const uint8_t *by
 }
 
 /* The no-op cell's bytes: both column selectors FINE by zero, everything else
- * zero (file format §5.5). */
+ * zero (file format §5.1). */
 static bool is_blank_pattern_bytes(const uint8_t *bytes, size_t len, bool wide)
 {
     int size = wide ? CELL_BYTES_WIDE : CELL_BYTES;
@@ -351,6 +466,16 @@ void te_upload_pattern(TaudEngine *e, int slot, const uint8_t *bytes, size_t len
     pat = pattern_for(e, idx);
     if (pat == NULL) return;
     decode_pattern(e, pat, bytes, len);
+}
+
+/* Deallocate a pattern slot: it reads as the empty pattern again, exactly as
+ * a slot that was never written (clearPattern). */
+void te_clear_pattern(TaudEngine *e, int slot)
+{
+    int idx = slot & 0x7fff;
+    if (idx >= NUM_PATTERNS) return;
+    if (!is_shared_blank(e, e->playdata[idx])) free(e->playdata[idx]);
+    e->playdata[idx] = NULL;
 }
 
 static TaudPlayInst decode_inst_word(int w)
@@ -440,9 +565,10 @@ void te_upload_sample_inst_blob(TaudEngine *e, const uint8_t *pool, size_t poolL
     e->hasPsg = false;
     for (i = 0; i < 1024; i++) if (e->instruments[i].psg != NULL) e->hasPsg = true;
     for (i = 0; i < NUM_INST_SLOTS; i++) {
-        free(e->instruments[i].extraPatches);
-        e->instruments[i].extraPatches = NULL;
-        e->instruments[i].patchCount = 0;
+        TaudInst *inst = &e->instruments[i];
+        te_retire(e, inst->extraPatches, sizeof(TaudPatch) * (size_t)inst->patchCount);
+        inst->extraPatches = NULL;
+        inst->patchCount = 0;
     }
     e->imixGen++;   /* byte 255 of every record may have moved */
 }
@@ -452,10 +578,11 @@ void te_upload_instrument_patches(TaudEngine *e, int slot, const uint8_t *bytes,
     TaudInst *inst = &e->instruments[slot & 0x3ff];
     TaudPatch *patches = NULL;
     int n = te_parse_patches_blob(bytes, len, &patches);
-    free(inst->extraPatches);
+    te_retire(e, inst->extraPatches, sizeof(TaudPatch) * (size_t)inst->patchCount);
     inst->extraPatches = n > 0 ? patches : NULL;
     inst->patchCount = n > 0 ? n : 0;
     if (n < 0) e->oom = true;
+    te_apply_pitch_ext(e, inst);
 }
 
 void te_set_cell_format(TaudEngine *e, bool wide)
@@ -467,7 +594,7 @@ void te_set_cell_format(TaudEngine *e, bool wide)
     e->volMax = wide ? VOLUME_MAX_WIDE : VOLUME_MAX;
     e->volStep = wide ? VOLUME_STEP_WIDE : 1;
     e->volDiv = e->volMax * 1.0;
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < TOTAL_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
         v->noteVolume = e->volMax;
         v->channelVolume = e->volMax;
@@ -508,6 +635,11 @@ static void apply_surround_model(TaudEngine *e)
     if (model == SURROUND_STEREO) return;
     e->spatial = (TaudSpatialBus *)calloc(1, sizeof *e->spatial);
     if (e->spatial == NULL) { e->oom = true; e->ts_surroundModel = SURROUND_STEREO; return; }
+    /* An exporter's render target stands in for the device's monitor. */
+    if (e->rendererKind >= 0 &&
+        te_spatial_bus_configure(e->spatial, e->rendererKind, e->rendererOrder, e->rendererPlanar, e->rendererLayout)) {
+        return;
+    }
     if (e->monitorMode == MONITOR_BINAURAL) {
         bool sphere = model == SURROUND_SPATIAL;
         if (e->binaural == NULL || e->binaural->sphere != sphere) {
@@ -536,6 +668,17 @@ void te_set_surround_model(TaudEngine *e, int model)
 void te_set_monitor_mode(TaudEngine *e, int mode)
 {
     e->monitorMode = mode & 1;
+    apply_surround_model(e);
+}
+
+/* Swap the render target the object bus feeds (setSpatialRenderer): −1 is the
+ * device's own monitor again. No-op for a stereo song, which has no bus. */
+void te_set_spatial_renderer(TaudEngine *e, int kind, int order, bool planar, int layout)
+{
+    e->rendererKind = kind;
+    e->rendererOrder = order;
+    e->rendererPlanar = planar;
+    e->rendererLayout = layout;
     apply_surround_model(e);
 }
 
@@ -586,7 +729,7 @@ void te_reset_play_state(TaudEngine *e)
     e->pendingInterrupts = 0;
     memset(e->interruptArgs, 0, sizeof e->interruptArgs);
     /* A play starts AT its levels: nothing glides in from the last one. */
-    for (i = 0; i < MAX_VOICES; i++) { e->voices[i].active = false; e->voices[i].faderCur = NAN; }
+    for (i = 0; i < TOTAL_VOICES; i++) { e->voices[i].active = false; e->voices[i].faderCur = NAN; }
     e->gvolGlide.cur = NAN;
     e->mvolGlide.cur = NAN;
     e->masterGlide.cur = NAN;
@@ -595,6 +738,9 @@ void te_reset_play_state(TaudEngine *e)
     /* …and the instruments' chains (item 217) for the same reason: a reverb
      * tail or a delay line still holding the previous take is that take. */
     te_imix_reset_chains(e);
+    /* …and the Mixing tab's meters: their integration describes one playback. */
+    for (i = 0; i < IMX_METER_SEATS; i++) if (e->imixMeters[i] != NULL) te_imix_tap_reset_all(e->imixMeters[i]);
+    if (e->masterMeter != NULL) te_master_meter_reset_all(e->masterMeter);
 }
 
 void te_set_tracker_row(TaudEngine *e, int row)
@@ -602,7 +748,7 @@ void te_set_tracker_row(TaudEngine *e, int row)
     int i;
     e->rowIndex = iclamp(row, 0, 63);
     te_reset_play_state(e);
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < TOTAL_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
         v->loopStartRow = 0; v->loopCount = 0;
         v->dittoActive = false; v->dittoSourceStart = 0; v->dittoLength = 0; v->dittoEndRow = 0;
@@ -634,33 +780,51 @@ void te_set_tracker_row(TaudEngine *e, int row)
     te_reconstruct_ditto_state(e, e->rowIndex);
 }
 
-void te_play(TaudEngine *e) { e->isPlaying = true; }
+/* Starting real playback ends any jam audition: leftover jammed voices are
+ * dropped so a held audition cannot bleed into the first rows of the song
+ * (Playhead's isPlaying setter). */
+void te_play(TaudEngine *e)
+{
+    if (!e->isPlaying && e->jamActive) {
+        int i;
+        for (i = 0; i < TOTAL_VOICES; i++) e->voices[i].active = false;
+        for (i = 0; i < e->bgCount; i++) e->bg[i]->active = false;
+        e->jamActive = false;
+    }
+    e->isPlaying = true;
+}
 
+/* Silence every voice the SONG owns — the lanes and the ghosts hanging off
+ * them — leaving the jam bank alone, so an audition held across a stop keeps
+ * sounding (Playhead.silenceSongVoices). `ramp` cuts through the note-cut
+ * ramp, for a mix that is still running. */
 void te_silence_song_voices(TaudEngine *e, bool ramp)
 {
     int i;
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < JAM_VOICE_BASE; i++) {
         TaudVoice *v = &e->voices[i];
         if (!v->active) continue;
         if (ramp) te_start_cut_ramp(e, v); else v->active = false;
     }
     for (i = 0; i < e->bgCount; i++) {
         TaudVoice *bg = e->bg[i];
-        if (!bg->active) continue;
+        if (!bg->active || bg->sourceChannel >= JAM_VOICE_BASE) continue;
         if (ramp) te_start_cut_ramp(e, bg); else bg->active = false;
     }
 }
 
+/* Ramped while an audition is still sounding, because that mix keeps running;
+ * dropped outright otherwise, where nothing renders and nothing is heard. */
 void te_stop(TaudEngine *e)
 {
     e->isPlaying = false;
-    te_silence_song_voices(e, false);
+    te_silence_song_voices(e, e->jamActive);
 }
 
 void te_reset_sample_fx_state(TaudEngine *e)
 {
     int i;
-    for (i = 0; i < MAX_VOICES; i++) {
+    for (i = 0; i < TOTAL_VOICES; i++) {
         TaudVoice *v = &e->voices[i];
         v->invertSpeed = 0;
         v->invertAccumulator = 0;
@@ -694,7 +858,32 @@ unsigned te_drain_interrupts(TaudEngine *e)
     return m;
 }
 
-bool te_render_chunk(TaudEngine *e) { return te_generate_tracker_audio(e); }
+/* Render one chunk; then a multichannel export's chain runs over its bus and
+ * the meters take the chunk in. Not on a chunk the song halted before. */
+bool te_render_chunk(TaudEngine *e)
+{
+    if (!te_generate_tracker_audio(e)) return false;
+    if (e->busMastering != NULL && e->spatial != NULL &&
+        te_master_chain_channels(e->busMastering) == e->spatial->numChannels) {
+        te_master_chain_process_planar(e->busMastering, e->spatial->data, TRACKER_CHUNK, TRACKER_CHUNK);
+    }
+    if (e->analysisTap != NULL || e->masterMeter != NULL) te_meters_after_render(e);
+    return true;
+}
+
+/* Master the render target's bus instead of the pair (a multichannel export,
+ * engine spec §12.3): `params` engaged = a chain as wide as the bus as it now
+ * stands — set the target first — or NULL / not engaged = none. The pair's
+ * own chain is the host's to switch off. */
+void te_set_bus_mastering(TaudEngine *e, const TaudMastering *params)
+{
+    te_master_chain_free(e->busMastering);
+    e->busMastering = NULL;
+    if (params == NULL || !te_mastering_engaged(params) || e->spatial == NULL) return;
+    e->busMastering = te_master_chain_new_planar(params, e->rate, e->spatial->numChannels,
+                                                 e->rendererKind == RENDER_AMBISONIC);
+    if (e->busMastering == NULL) e->oom = true;
+}
 
 /* Install the project's LYRICS (the `ILyr` section, §9.17): `count` decoded
  * entries, replacing whatever was installed — an instrument no entry names
@@ -744,7 +933,13 @@ TaudEngine *te_engine_new(int rate)
         te_engine_free(e);
         return NULL;
     }
-    for (i = 0; i < NUM_INST_SLOTS; i++) te_inst_init(&e->instruments[i], i);
+    for (i = 0; i < NUM_INST_SLOTS; i++) {
+        te_inst_init(&e->instruments[i], i);
+        e->instruments[i].engine = e;
+    }
+    e->retireSweepAt = RETIRE_SWEEP_COUNT;
+    e->jamLyricInst = -1;
+    e->rendererKind = -1;
     for (i = 0; i < ROWS_PER_PATTERN; i++) e->emptyPattern[i].pan = 32;
     cue_init(&e->emptyCue);
 
@@ -757,7 +952,7 @@ TaudEngine *te_engine_new(int rate)
 
     /* TrackerState defaults. */
     e->firstRow = true;
-    for (i = 0; i < MAX_VOICES; i++) te_voice_init(&e->voices[i]);
+    for (i = 0; i < TOTAL_VOICES; i++) te_voice_init(&e->voices[i]);
     e->volMax = VOLUME_MAX;
     e->volStep = 1;
     e->volDiv = 63.0;
@@ -794,8 +989,20 @@ void te_engine_free(TaudEngine *e)
     c = e->chunks;
     while (c != NULL) { TaudVoiceChunk *n = c->next; free(c); c = n; }
     free(e->spatial);
+    free(e->analysisBus);
+    free(e->analysisTap);
+    te_master_meter_free(e->masterMeter);
+    te_master_chain_free(e->busMastering);
+    for (i = 0; i < IMX_METER_SEATS; i++) free(e->imixMeters[i]);
+    free(e->stemLog);
     te_binaural_free(e->binaural);
     te_master_chain_free(e->mastering);
     te_imix_free_routes(e);
+    for (i = 0; i < e->retiredCount; i++) free(e->retired[i].ptr);
+    free(e->retired);
+    free(e->ownPool);
+    free(e->ownImix);
+    te_pitch_ext_free(e);
+    te_lyrics_free(e->ownLyrics, e->ownLyricCount);
     free(e);
 }

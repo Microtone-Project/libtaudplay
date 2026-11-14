@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <stddef.h>
+
 #include "taud_internal.h"
 
 #define PI 3.141592653589793
@@ -511,7 +513,7 @@ static void lfo_reset(ImxLfo *l) { l->phase = 0; l->held = 0; l->rng = 0x9e3779b
 
 /* Phase increment per sample (lfoIncrement): floor(R·2^16 / fs) in Hz mode,
  * floor(2^51·bpm / (5·P·fs)) in sync mode, at most 2^31 − 1. */
-static int64_t lfo_increment(bool sync, uint32_t rate, int bpm, int fs)
+int64_t te_imx_lfo_increment(bool sync, uint32_t rate, int bpm, int fs)
 {
     int64_t inc;
     if (!sync) {
@@ -530,7 +532,7 @@ static void lfo_tempo(ImxLfo *l, int bpm, int fs)
     int sync = l->p.sync ? 1 : 0;
     if (sync != l->kSync || (int64_t)l->p.rate != l->kRate || fs != l->kFs || (sync == 1 && bpm != l->kBpm)) {
         l->kSync = sync; l->kRate = l->p.rate; l->kBpm = bpm; l->kFs = fs;
-        l->inc = lfo_increment(l->p.sync, l->p.rate, bpm, fs);
+        l->inc = te_imx_lfo_increment(l->p.sync, l->p.rate, bpm, fs);
     }
 }
 
@@ -712,6 +714,9 @@ typedef struct {
     bool shut;
     double ms;         /* RMS detector's mean square */
     bool oom;
+    /* Readings for the meter: the span's deepest gain and its loudest
+     * detector level, dB. */
+    double gr, lvl;
 } ImxExpander;
 
 static void expd_init(ImxExpander *s)
@@ -719,6 +724,7 @@ static void expd_init(ImxExpander *s)
     memset(s, 0, sizeof *s);
     te_bq_init(&s->hp);
     te_bq_init(&s->lp);
+    s->lvl = -120;
 }
 
 static void expd_configure(ImxExpander *s, const TaudImxEquipment *p, double rate)
@@ -743,6 +749,7 @@ static void expd_reset(ImxExpander *s)
     te_bq_reset(&s->hp);
     te_bq_reset(&s->lp);
     s->g = 0; s->hold = 0; s->shut = false; s->ms = 0;
+    s->gr = 0; s->lvl = -120;
 }
 
 static void expd_process(ImxExpander *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
@@ -755,6 +762,7 @@ static void expd_process(ImxExpander *s, double *data, int stride, int n0, int n
     double g = s->g, ms = s->ms;
     int hold = s->hold;
     bool shut = s->shut;
+    double gr = 0, lvl = -120;
     if (s->oom) return;
     if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
     for (i = n0; i < n1; i++) {
@@ -767,6 +775,7 @@ static void expd_process(ImxExpander *s, double *data, int stride, int n0, int n
         if (peak) level = peak_push(&s->win, l);
         else { ms += (sum / nch - ms) * s->rmsCoef; level = sqrt(ms); }
         L = level > 1e-6 ? 20 * js_log10(level) : -120;
+        if (L > lvl) lvl = L;
         if (L < floor_) shut = true;
         else if (L >= reopen) shut = false;
         if (shut) target = -range;
@@ -778,10 +787,12 @@ static void expd_process(ImxExpander *s, double *data, int stride, int n0, int n
         if (target >= g) { g += (target - g) * s->atk; hold = s->holdN; }
         else if (hold > 0) hold--;
         else g += (target - g) * s->rel;
+        if (g < gr) gr = g;
         k = te_db_to_gain(g);
         for (c = 0; c < nch; c++) data[c * stride + i] *= k;
     }
     s->g = g; s->hold = hold; s->shut = shut; s->ms = ms;
+    s->gr = gr; s->lvl = lvl;
     mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
 }
 
@@ -868,6 +879,9 @@ typedef struct {
     double env[IMX_DEQ_BANDS], actor[IMX_DEQ_BANDS], atk[IMX_DEQ_BANDS], rel[IMX_DEQ_BANDS];
     int live[IMX_DEQ_BANDS], nLive;
     int ctl;
+    /* Readings for the meter, per band: the dynamic gain the actor applied
+     * (signed, the span's extreme) and the loudest sense level, dB. */
+    double gr[IMX_DEQ_BANDS], lvl[IMX_DEQ_BANDS];
 } ImxDeq;
 
 static void deq_init(ImxDeq *s, int rate)
@@ -878,6 +892,7 @@ static void deq_init(ImxDeq *s, int rate)
         te_bq_init(&s->act[i]);
         te_bq_init(&s->sense[i]);
         s->actor[i] = 1;
+        s->lvl[i] = -120;
     }
     s->rate = rate;
 }
@@ -921,6 +936,7 @@ static void deq_reset(ImxDeq *s)
         s->env[i] = 0;
     }
     s->ctl = 0;
+    memset(s->gr, 0, sizeof s->gr);
     if (s->hasP) for (i = 0; i < s->nLive; i++) deq_set_act(s, s->live[i]);
 }
 
@@ -928,6 +944,7 @@ static void deq_process(ImxDeq *s, double *data, int stride, int n0, int n1, con
 {
     int nch = ctx->nch, n, k, c;
     if (s->nLive == 0) return;
+    for (k = 0; k < IMX_DEQ_BANDS; k++) { s->gr[k] = 0; s->lvl[k] = -120; }
     for (n = n0; n < n1; n++) {
         if (s->ctl == 0) for (k = 0; k < s->nLive; k++) deq_set_act(s, s->live[k]);
         s->ctl = s->ctl + 1 == IMX_CONTROL_PERIOD ? 0 : s->ctl + 1;
@@ -943,6 +960,7 @@ static void deq_process(ImxDeq *s, double *data, int stride, int n0, int n1, con
                 if (a > level) level = a;
             }
             levelDb = level > 1e-6 ? 20 * js_log10(level) : -120;
+            if (levelDb > s->lvl[i]) s->lvl[i] = levelDb;
             over = levelDb - b->threshDb;
             amt = over > 0 ? over * (1 - 1 / (double)b->ratio) : 0;
             if (amt > b->rangeDb) amt = b->rangeDb;
@@ -950,6 +968,11 @@ static void deq_process(ImxDeq *s, double *data, int stride, int n0, int n1, con
             cur = s->env[i];
             away = (target < 0 ? -target : target) > (cur < 0 ? -cur : cur);
             s->env[i] = cur + (target - cur) * (away ? s->atk[i] : s->rel[i]);
+            {
+                /* The meter reads what the actor applies. */
+                double ev = s->env[i] * s->actor[i];
+                if ((ev < 0 ? -ev : ev) > (s->gr[i] < 0 ? -s->gr[i] : s->gr[i])) s->gr[i] = ev;
+            }
             for (c = 0; c < nch; c++) {
                 int j = c * stride + n;
                 data[j] = te_bq_run(&s->act[i], c, data[j]);
@@ -1074,6 +1097,10 @@ typedef struct {
     TaudImxEquipment p;
     ImxSplit xo;
     TaudCompressor comps[IMX_COMP_MAX_BANDS];
+    /* Readings for the meter, per band: the span's deepest reduction and its
+     * loudest detector level, dB. */
+    double gr[IMX_COMP_MAX_BANDS], lvl[IMX_COMP_MAX_BANDS];
+    bool lvlInit;
 } ImxComp;
 
 static void comp_configure(ImxComp *s, const TaudImxEquipment *p, double rate)
@@ -1097,12 +1124,15 @@ static void comp_reset(ImxComp *s)
     int k;
     split_reset(&s->xo);
     for (k = 0; k < IMX_COMP_MAX_BANDS; k++) te_comp_reset(&s->comps[k]);
+    memset(s->gr, 0, sizeof s->gr);
 }
 
 static void comp_process(ImxComp *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
 {
     int nch = ctx->nch, n = s->xo.bandsN, i, k, c;
     double dry = ctx->dry;
+    for (k = 0; k < IMX_COMP_MAX_BANDS; k++) { s->gr[k] = 0; s->lvl[k] = -120; }
+    s->lvlInit = true;
     if (n == 1) {
         TaudCompressor *comp = &s->comps[0];
         if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
@@ -1110,6 +1140,8 @@ static void comp_process(ImxComp *s, double *data, int stride, int n0, int n1, c
             for (i = n0; i < n1; i++) {
                 double g = te_comp_step_planar(comp, data, i, stride, nch);
                 for (c = 0; c < nch; c++) data[c * stride + i] *= g;
+                if (comp->grDb < s->gr[0]) s->gr[0] = comp->grDb;
+                if (comp->levelDb > s->lvl[0]) s->lvl[0] = comp->levelDb;
             }
         }
         mix_dry(data, ctx->dryBuf, nch, stride, n0, n1, dry);
@@ -1124,6 +1156,8 @@ static void comp_process(ImxComp *s, double *data, int stride, int n0, int n1, c
         for (i = n0; i < n1; i++) {
             double g = te_comp_step_planar(comp, b, i, stride, nch);
             for (c = 0; c < nch; c++) b[c * stride + i] *= g;
+            if (comp->grDb < s->gr[k]) s->gr[k] = comp->grDb;
+            if (comp->levelDb > s->lvl[k]) s->lvl[k] = comp->levelDb;
         }
     }
     split_sum(&s->xo, data, stride, n0, n1, nch);
@@ -1146,6 +1180,7 @@ typedef struct {
     double atk[IMX_TSH_MAX_BANDS], rel[IMX_TSH_MAX_BANDS];
     double smooth;
     bool oom;
+    double gr[IMX_TSH_MAX_BANDS];   /* reading for the meter: signed, the span's extreme */
 } ImxTransient;
 
 static void tsh_free(ImxTransient *s)
@@ -1189,6 +1224,7 @@ static void tsh_reset(ImxTransient *s)
 {
     split_reset(&s->xo);
     tsh_clear(s);
+    memset(s->gr, 0, sizeof s->gr);
 }
 
 /* Band k over [n0, n1) of `b`, in place. */
@@ -1199,6 +1235,7 @@ static void tsh_band(ImxTransient *s, int k, double *b, int stride, int n0, int 
     double S = s->S[k], L = s->L[k], e = s->e[k];
     double atk = s->atk[k], rel = s->rel[k], sm = s->smooth;
     double ga = band->attackDb, gs = band->sustainDb, out = band->outDb;
+    double gr = s->gr[k];
     int i, c;
     for (i = n0; i < n1; i++) {
         double l = 0, P, tr, su, g;
@@ -1213,16 +1250,19 @@ static void tsh_band(ImxTransient *s, int k, double *b, int stride, int n0, int 
         tr = P > 0 ? 1 - S / P : 0;
         su = L > 0 ? 1 - P / L : 0;
         e += (ga * tr + gs * su - e) * sm;
+        if ((e < 0 ? -e : e) > (gr < 0 ? -gr : gr)) gr = e;
         g = te_db_to_gain(e + out);
         for (c = 0; c < nch; c++) b[c * stride + i] *= g;
     }
     s->S[k] = S; s->L[k] = L; s->e[k] = e;
+    s->gr[k] = gr;
 }
 
 static void tsh_process(ImxTransient *s, double *data, int stride, int n0, int n1, const ImxCtx *ctx)
 {
     int nch = ctx->nch, n = s->xo.bandsN, k;
     double dry = ctx->dry;
+    memset(s->gr, 0, sizeof s->gr);
     if (s->oom) return;
     if (n == 1) {
         if (dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
@@ -1372,6 +1412,7 @@ typedef struct {
     ImxLfo lfoD, lfoW;
     double xfade[4097];         /* sin²(π·i/4096) */
     bool oom;
+    double curCents, curWidth;  /* what the last control period set, for the meter */
 } ImxUnison;
 
 static void unis_init(ImxUnison *s, int nch, int rate)
@@ -1466,6 +1507,8 @@ static void unis_control(ImxUnison *s)
     double width = p->u.unis.width * (1 + wl);
     cents = cents < 0 ? 0 : cents > 100 ? 100 : cents;
     width = width < 0 ? 0 : width > 1 ? 1 : width;
+    s->curCents = cents;
+    s->curWidth = width;
     for (k = 0; k < nv; k++) {
         double r = js_pow(2, (s->pos[k] * cents) / 1200);
         /* (1 − r) samples per sample across a window of `win`, as a U32 phase. */
@@ -1735,12 +1778,15 @@ static void delay_init(ImxDelay *s, int nch, int rate)
 static void delay_configure(ImxDelay *s, const TaudImxEquipment *p, double rate)
 {
     s->p = *p;
-    if ((int)rate != s->rate || s->buf == NULL) {
+    if ((int)rate != s->rate || s->len == 0) {
         s->rate = (int)rate;
         s->len = (int)ceil(IMX_DELAY_MAX_SEC * rate) + 16;
+        /* The line itself — four seconds a channel, most of what a chain
+         * weighs — is made when the first sample has to go into it
+         * (delay_process): an instrument that names a chain and never sounds
+         * holds none. A line not yet made is a line of silence. */
         free(s->buf);
-        s->buf = (double *)calloc((size_t)s->nch * s->len, sizeof(double));
-        if (s->buf == NULL) s->oom = true;
+        s->buf = NULL;
         s->w = 0;
         s->started = false;
     }
@@ -1796,6 +1842,10 @@ static void delay_process(ImxDelay *s, double *data, int stride, int n0, int n1,
     int pa = pingPong && s->p.u.dlay.pingRight ? 1 : 0, pb = 1 - pa;
     if (ctx->dry > 0) copy_span(data, ctx->dryBuf, nch, stride, n0, n1);
     if (s->oom) return;
+    if (buf == NULL) {
+        buf = s->buf = (double *)calloc((size_t)s->nch * s->len, sizeof(double));
+        if (buf == NULL) { s->oom = true; return; }
+    }
     s->t = delay_target(s, ctx->bpm);
     if (!s->started) { s->d = s->t; s->started = true; }
     for (n = n0; n < n1; n++) {
@@ -1935,6 +1985,9 @@ struct TaudImxChain {
     int silentRun, idleAfter;
     ImxCtx ctx;
     bool oom;
+    /* The Mixing tab's taps metering this chain's bus while it runs (two when
+     * both seats meter one bus), or NULL. */
+    struct TaudImixTap *probe[2];
 };
 
 static void *make_stage(TaudImxChain *c, int k)
@@ -2156,6 +2209,8 @@ void te_imx_chain_process(TaudImxChain *c, double *data, int stride, int n0, int
         for (ch = 0; ch < nch; ch++) if (data[ch * stride + n] != 0) { lastIn = n; break; }
     }
     for (i = 0; i < c->nActive; i++) {
+        if (c->probe[0] != NULL) te_imix_tap_stage_in(c->probe[0], c->active[i], n0, n1);
+        if (c->probe[1] != NULL) te_imix_tap_stage_in(c->probe[1], c->active[i], n0, n1);
         c->ctx.dry = c->activeDry[i];
         stage_process(c, c->active[i], data, stride, n0, n1);
     }
@@ -2191,7 +2246,7 @@ void te_imx_chain_process(TaudImxChain *c, double *data, int stride, int n0, int
 static uintptr_t current_renderer(const TaudEngine *e)
 {
     if (e->spatial == NULL) return 0;
-    if (e->spatial->kind == 1) return (uintptr_t)e->spatial->bin;
+    if (e->spatial->kind == RENDER_BINAURAL) return (uintptr_t)e->spatial->bin;
     return ((uintptr_t)e->rendererGen << 1) | 1;
 }
 
@@ -2229,13 +2284,13 @@ static TaudImixBus *bus_new(TaudEngine *e, int slot, const TaudImixBlock *block)
         bus->stereo = true;
         scene = false;
     } else {
-        bus->sb.kind = e->spatial->kind;
-        bus->sb.bin = e->spatial->bin;
+        /* The same render target as the master bus, less its data. */
+        memcpy(&bus->sb, e->spatial, offsetof(TaudSpatialBus, data));
         bus->nch = e->spatial->numChannels;
         /* The device renders a surround song through a stereo fold: its two
          * channels ARE a left/right pair. */
-        bus->stereo = bus->nch == 2 && e->spatial->kind == 0;
-        scene = e->spatial->kind == 1;
+        bus->stereo = bus->nch == 2 && e->spatial->kind == RENDER_STEREO;
+        scene = e->spatial->kind == RENDER_BINAURAL || e->spatial->kind == RENDER_AMBISONIC;
     }
     bus->sb.numChannels = bus->nch;
     bus->chain = te_imx_chain_new(block, e->rate, bus->nch, bus->stereo, scene);
@@ -2332,4 +2387,65 @@ void te_imix_reset_chains(TaudEngine *e)
     int i;
     for (i = 0; i < e->imixCount; i++) te_imx_chain_reset(e->imixList[i]->chain);
     memset(e->imixTrig, 0, sizeof e->imixTrig);
+}
+
+/* ── readings for the Mixing tab's meters ── */
+
+void te_imx_chain_set_probes(TaudImxChain *c, struct TaudImixTap *a, struct TaudImixTap *b)
+{
+    c->probe[0] = a;
+    c->probe[1] = b;
+}
+
+/* The chain's gain reductions over the span it last processed (readGr): each
+ * compressor band's (dB, ≤ 0), each dynamic-EQ and transient-shaper band's
+ * dynamic gain (signed), the expander's and the limiter's (≤ 0), and the
+ * loudest detector reading of the expander and of every comp and dynamic-EQ
+ * band (dB, −120 = nothing). A piece out of the chain reads at rest. */
+void te_imx_chain_read_gr(const TaudImxChain *c, TaudImxGr *out)
+{
+    int i, k;
+    memset(out, 0, sizeof *out);
+    out->expdLvl = -120;
+    for (k = 0; k < IMX_COMP_MAX_BANDS; k++) out->compLvl[k] = -120;
+    for (k = 0; k < IMX_DEQ_BANDS; k++) out->deq1Lvl[k] = out->deq2Lvl[k] = -120;
+    for (i = 0; i < c->nActive; i++) {
+        int id = c->active[i];
+        const void *st = c->stage[id];
+        if (st == NULL) continue;
+        if (id == IMX_EXPD) {
+            out->expd = ((const ImxExpander *)st)->gr;
+            out->expdLvl = ((const ImxExpander *)st)->lvl;
+        } else if (id == IMX_COMP) {
+            const ImxComp *s = (const ImxComp *)st;
+            for (k = 0; k < IMX_COMP_MAX_BANDS; k++) {
+                out->comp[k] = s->gr[k];
+                out->compLvl[k] = s->lvlInit ? s->lvl[k] : -120;
+            }
+        } else if (id == IMX_TSH1) {
+            for (k = 0; k < IMX_TSH_MAX_BANDS; k++) out->tsh1[k] = ((const ImxTransient *)st)->gr[k];
+        } else if (id == IMX_DEQ1 || id == IMX_DEQ2) {
+            const ImxDeq *s = (const ImxDeq *)st;
+            double *gr = id == IMX_DEQ1 ? out->deq1 : out->deq2;
+            double *lvl = id == IMX_DEQ1 ? out->deq1Lvl : out->deq2Lvl;
+            for (k = 0; k < IMX_DEQ_BANDS; k++) { gr[k] = s->gr[k]; lvl[k] = s->lvl[k]; }
+        } else if (id == IMX_LIMI) {
+            out->lim = ((const ImxLimiter *)st)->stage.grDb;
+        }
+    }
+}
+
+/* The unison's live detune (cents) and width while it is in the chain. */
+bool te_imx_chain_unison_now(const TaudImxChain *c, double *cents, double *width)
+{
+    int i;
+    for (i = 0; i < c->nActive; i++) {
+        if (c->active[i] == IMX_UNIS && c->stage[IMX_UNIS] != NULL) {
+            const ImxUnison *s = (const ImxUnison *)c->stage[IMX_UNIS];
+            *cents = s->curCents;
+            *width = s->curWidth;
+            return true;
+        }
+    }
+    return false;
 }

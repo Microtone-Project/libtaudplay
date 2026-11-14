@@ -97,12 +97,19 @@ void te_doc_free(TaudDoc *doc)
     free(doc->ixmp);
     free(doc->projectName);
     free(doc->imix);
-    for (i = 0; i < doc->numLyrics; i++) {
-        free(doc->lyrics[i].syllables);
-        free(doc->lyrics[i].recipes);
-    }
-    free(doc->lyrics);
+    te_lyrics_free(doc->lyrics, doc->numLyrics);
     memset(doc, 0, sizeof *doc);
+}
+
+void te_lyrics_free(TaudLyricEntry *list, int count)
+{
+    int i;
+    if (list == NULL) return;
+    for (i = 0; i < count; i++) {
+        free(list[i].syllables);
+        free(list[i].recipes);
+    }
+    free(list);
 }
 
 /* The `ILyr` section (§9.17, lyric-section.js parseLyricSection): entries
@@ -111,7 +118,7 @@ void te_doc_free(TaudDoc *doc)
  * entry with no syllable or shorter than its counts is dropped, and so is a
  * second entry for an instrument; a truncated one ends the walk. Returns the
  * entries kept, or -1 out of memory. */
-static int parse_lyrics(const uint8_t *pl, size_t len, TaudLyricEntry **out)
+int te_parse_lyrics(const uint8_t *pl, size_t len, TaudLyricEntry **out)
 {
     TaudLyricEntry *list = NULL;
     int n = 0, cap = 0;
@@ -419,9 +426,15 @@ TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc)
     /* …and the lyric instruments' lyrics (§9.17), for the same reason. */
     sec = find_sec(secs, nSecs, "ILyr");
     if (sec != NULL) {
-        int n = parse_lyrics(doc->projData + sec->off, sec->len, &doc->lyrics);
+        int n = te_parse_lyrics(doc->projData + sec->off, sec->len, &doc->lyrics);
         if (n < 0) { err = TAUD_ERR_NOMEM; goto fail; }
         doc->numLyrics = n;
+    }
+    /* …and the instruments' pitch extensions (§9.18), for the same reason. */
+    sec = find_sec(secs, nSecs, "IPit");
+    if (sec != NULL) {
+        doc->pitchExtOff = sec->off;
+        doc->pitchExtLen = sec->len;
     }
     free(secs);
     return TAUD_OK;
@@ -483,4 +496,6 @@ void te_load_into_engine(TaudEngine *e, const TaudDoc *doc, int songIndex)
     for (p = 0; p < doc->numIxmp; p++) {
         te_upload_instrument_patches(e, doc->ixmp[p].instId, doc->ixmp[p].blob, doc->ixmp[p].len);
     }
+    /* …and the pitch extensions of the records and patches just loaded. */
+    te_set_pitch_ext(e, doc->pitchExtLen > 0 ? doc->projData + doc->pitchExtOff : NULL, doc->pitchExtLen);
 }

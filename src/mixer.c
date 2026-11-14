@@ -3,6 +3,7 @@
  * The voices sum in binary64; the pair narrows to binary32 (the mix bus)
  * exactly once per frame, then mastering, clamp and (optionally) dither. */
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "taud_internal.h"
@@ -134,6 +135,8 @@ void te_dither_u8(uint32_t *xs, float err[4], const float *left, const float *ri
 void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out)
 {
     te_dither_u8(&e->xorshift, e->ditherError, e->mixLeft, e->mixRight, TRACKER_CHUNK, out);
+    /* The Mastering view's census counts the codes delivered. */
+    if (e->masterMeter != NULL) te_master_meter_bin(e->masterMeter, out, e->mixLeft, e->mixRight, TRACKER_CHUNK);
 }
 
 static inline double attack_gain(const TaudEngine *e, int attackRampSamples)
@@ -151,6 +154,12 @@ static void run_imix_buses(TaudEngine *e, int n0, int n1)
 {
     const double *gainSpan = e->gainSpan;
     TaudSpatialBus *spatial = e->spatial;
+    /* Each tap meters the bus its instrument mixes into — in bus mode the one
+     * every instrument on the block shares. Two seats (one per split pane)
+     * may meter two buses, or both the same one. */
+    TaudImixTap *meterA = e->imixMeters[0], *meterB = e->imixMeters[1];
+    const TaudImixBus *busA = meterA != NULL ? e->imixRoutes[meterA->slot & 0x3ff] : NULL;
+    const TaudImixBus *busB = meterB != NULL ? e->imixRoutes[meterB->slot & 0x3ff] : NULL;
     int b, k, n, c;
     for (b = 0; b < e->imixCount; b++) {
         TaudImixBus *bus = e->imixList[b];
@@ -165,7 +174,15 @@ static void run_imix_buses(TaudEngine *e, int n0, int n1)
         if (te_imx_chain_idle(chain) && !bus->fed) {
             te_imx_chain_process(chain, d, TRACKER_CHUNK, n0, n1, e->bpm, false);
         } else {
+            TaudImixTap *ta = busA == bus ? meterA : NULL;
+            TaudImixTap *tb = busB == bus ? meterB : NULL;
+            if (ta != NULL) te_imix_tap_push_pre(ta, bus, n0, n1);
+            if (tb != NULL) te_imix_tap_push_pre(tb, bus, n0, n1);
+            te_imx_chain_set_probes(chain, ta, tb);
             te_imx_chain_process(chain, d, TRACKER_CHUNK, n0, n1, e->bpm, bus->fed);
+            te_imx_chain_set_probes(chain, NULL, NULL);
+            if (ta != NULL) te_imix_tap_push_post(ta, bus, n0, n1);
+            if (tb != NULL) te_imix_tap_push_post(tb, bus, n0, n1);
             if (spatial == NULL) {
                 for (n = n0; n < n1; n++) {
                     e->accL[n] += d[n] * gainSpan[n];
@@ -234,11 +251,33 @@ static inline TaudImixBus *voice_route(const TaudEngine *e, const TaudVoice *v)
     return e->imixRoutes[(v->displayInst != 0 ? v->displayInst : v->instrumentId) & 0x3ff];
 }
 
+/* The stem tap: one more entry in the chunk's log. */
+static void stem_push(TaudEngine *e, int frame, int lane, const TaudVoice *v, double value)
+{
+    TaudStemEntry *it;
+    if (e->stemCount == e->stemCap) {
+        int nc = e->stemCap ? e->stemCap * 2 : 4096;
+        TaudStemEntry *nl = (TaudStemEntry *)realloc(e->stemLog, sizeof *nl * (size_t)nc);
+        if (nl == NULL) { e->oom = true; return; }
+        e->stemLog = nl;
+        e->stemCap = nc;
+    }
+    it = &e->stemLog[e->stemCount++];
+    it->frame = frame;
+    it->lane = lane;
+    it->top = v->displayInst != 0 ? v->displayInst : v->instrumentId;
+    it->sub = v->instrumentId;
+    it->patch = v->activePatchIndex;
+    it->pad = 0;
+    it->value = value;
+}
+
 /* Render one TRACKER_CHUNK into mixLeft/mixRight. */
 bool te_generate_tracker_audio(TaudEngine *e)
 {
     bool advancing = e->isPlaying;
     TaudSpatialBus *spatial = e->spatial;
+    TaudSpatialBus *abus = e->analysisBus;
     double srate = e->rate;
     int n, vi, i, n0 = 0;
 
@@ -246,6 +285,10 @@ bool te_generate_tracker_audio(TaudEngine *e)
         int c;
         for (c = 0; c < spatial->numChannels * TRACKER_CHUNK; c++) spatial->data[c] = 0.0;
     }
+    /* The master strip's analysis bus (item 98): an accumulator like the
+     * monitor's, fed with the same sources. */
+    if (abus != NULL) memset(abus->data, 0, sizeof(double) * (size_t)(abus->numChannels * TRACKER_CHUNK));
+    e->stemCount = 0;
 
     if (advancing && e->firstRow) {
         e->firstRow = false;
@@ -306,7 +349,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
         e->accL[n] = 0.0;
         e->accR[n] = 0.0;
 
-        for (vi = 0; vi < MAX_VOICES; vi++) {
+        for (vi = 0; vi < TOTAL_VOICES; vi++) {
             TaudVoice *voice = &e->voices[vi];
             TaudInst *inst;
             TaudImixBus *route;
@@ -364,6 +407,9 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 rampGain *= attack_gain(e, voice->attackRampSamples);
                 voice->attackRampSamples--;
             }
+            if (e->stemTap) {
+                stem_push(e, n, vi, voice, (voice->activeChanCount == 2 ? (sL + sR) * 0.5 : sL) * vol * rampGain);
+            }
             /* An instrument with a mixing chain mixes into its own bus, ahead of
              * the song's global gain — which the bus's output gets instead. */
             route = voice_route(e, voice);
@@ -389,6 +435,13 @@ bool te_generate_tracker_audio(TaudEngine *e)
                     te_spatial_bus_add_source(spatial, n, sR * vol, g, spatial->numChannels, rampGain);
                 }
             }
+            if (abus != NULL) {
+                const double *ag = te_analysis_voice_gains(e, voice);
+                te_spatial_bus_add_source(abus, n, sL * vol, ag, 0, rampGain);
+                if (voice->activeChanCount == 2) {
+                    te_spatial_bus_add_source(abus, n, sR * vol, ag, abus->numChannels, rampGain);
+                }
+            }
         }
 
         for (i = 0; i < e->bgCount; i++) {
@@ -400,7 +453,7 @@ bool te_generate_tracker_audio(TaudEngine *e)
             double pair[2], sL, sR, instGv, swingScale, effEnvVol, fade, faderGain, vol;
             double lGain = 0.0, rGain = 0.0, rampGain;
             if (bg->fmOperator) continue;
-            srcVoice = bg->sourceChannel >= 0 && bg->sourceChannel < MAX_VOICES ? &e->voices[bg->sourceChannel] : NULL;
+            srcVoice = bg->sourceChannel >= 0 && bg->sourceChannel < TOTAL_VOICES ? &e->voices[bg->sourceChannel] : NULL;
             bgFader = srcVoice != NULL && srcVoice->fader > bg->fader ? srcVoice->fader : bg->fader;
             if (!bg->active) continue;
             if (isnan(bg->faderCur)) { bg->faderCur = bgFader; bg->faderAim = bgFader; bg->faderLeft = 0; }
@@ -447,6 +500,10 @@ bool te_generate_tracker_audio(TaudEngine *e)
                 rampGain *= attack_gain(e, bg->attackRampSamples);
                 bg->attackRampSamples--;
             }
+            /* Ghosts and layer children belong to the stem of the lane that spawned them. */
+            if (e->stemTap) {
+                stem_push(e, n, bg->sourceChannel, bg, (bg->activeChanCount == 2 ? (sL + sR) * 0.5 : sL) * vol * rampGain);
+            }
             route = voice_route(e, bg);
             if (route != NULL) {
                 /* The same chain without the three song-level gains the bus is ahead of. */
@@ -474,10 +531,21 @@ bool te_generate_tracker_audio(TaudEngine *e)
                     te_spatial_bus_add_source(spatial, n, sR * vol, g, spatial->numChannels, rampGain);
                 }
             }
+            if (abus != NULL) {
+                const double *ag = te_analysis_voice_gains(e, bg);
+                te_spatial_bus_add_source(abus, n, sL * vol, ag, 0, rampGain);
+                if (bg->activeChanCount == 2) {
+                    te_spatial_bus_add_source(abus, n, sR * vol, ag, abus->numChannels, rampGain);
+                }
+            }
         }
     }
     finish_span(e, n0, TRACKER_CHUNK);
 
+    if (e->preTap) {
+        memcpy(e->preLeft, e->mixLeft, sizeof e->preLeft);
+        memcpy(e->preRight, e->mixRight, sizeof e->preRight);
+    }
     if (e->mastering != NULL) te_master_chain_process(e->mastering, e->mixLeft, e->mixRight, TRACKER_CHUNK);
     /* The OPL chip clock (item 209) counts the frames this playhead has mixed. */
     e->oplFrame += TRACKER_CHUNK;
@@ -487,7 +555,16 @@ bool te_generate_tracker_audio(TaudEngine *e)
         if (fr < -1.0f) e->mixRight[n] = -1.0f; else if (fr > 1.0f) e->mixRight[n] = 1.0f;
     }
 
-    /* A halt cue clears isPlaying mid-chunk: end the song's voices here. */
-    if (advancing && !e->isPlaying) te_silence_song_voices(e, false);
+    /* A halt cue clears isPlaying mid-chunk: end the song's voices here —
+     * ramped while an audition keeps the mix running. */
+    if (advancing && !e->isPlaying) te_silence_song_voices(e, e->jamActive);
+
+    /* Stop the jam-render spin once the audition has gone fully silent. */
+    if (e->jamActive && !e->isPlaying) {
+        bool sounding = false;
+        for (vi = 0; vi < TOTAL_VOICES && !sounding; vi++) sounding = e->voices[vi].active;
+        for (i = 0; i < e->bgCount && !sounding; i++) sounding = e->bg[i]->active;
+        if (!sounding) e->jamActive = false;
+    }
     return true;
 }

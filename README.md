@@ -7,13 +7,14 @@
 
 **Play `.taud` songs from C. No tracker, no browser, no dependencies.**
 
-A portable C99 port of [`taudplay`](https://github.com/curioustorvald/microtone-taudplay),
-the playback half of the [Microtone](https://microtone.cc) tracker. It is the
-same engine, note for note and **sample for sample**: at the reference rate a
-render here is bit-identical to the same song rendered by the JavaScript
-library (and so by the tracker itself) — verified over the whole Microtone
-test corpus, a differential fuzzer and an API-level scenario test (see
-[Verification](#verification)).
+The playback engine of the [Microtone](https://microtone.cc) tracker, as a
+portable C99 library. Since Microtone 5.0 this is not a port of that engine but
+the engine itself: the tracker and the JavaScript library
+[`taudplay`](https://github.com/curioustorvald/microtone-taudplay) run these
+same sources, compiled to WebAssembly. So a render here is the tracker's, note
+for note and **sample for sample** — bit-identical on every platform, verified
+over the whole Microtone test corpus, a differential fuzzer and an API-level
+scenario test (see [Verification](#verification)).
 
 The surface is the JS library's, kept deliberately small:
 
@@ -217,18 +218,19 @@ afresh, so the same floats always make the same file.
   (in blocks of 64 voices) only when a note storm outgrows every earlier one,
   and an instrument's invert/modification mask (8 KiB) is allocated the first
   time an effect needs it. Pools are reclaimed by marking what the lanes can
-  still reach — the objects the JavaScript engine's garbage collector keeps.
+  still reach.
 - **Hostile input.** Every length and offset in the container is checked, the
   zstd and inflate decoders are bounds-checked, and the engine is exercised
   under AddressSanitizer + UBSan with thousands of corrupted files
-  (`make robust`). Where the JavaScript engine would throw on a malformed file
-  (an envelope loop point past its 25 nodes, say) the C engine reads the nearest
-  valid entry instead; no file the JavaScript can play is affected by that.
+  (`make robust`). A malformed field (an envelope loop point past its 25
+  nodes, say) is read as the nearest valid entry; no well-formed file is
+  affected by that.
 - **Randomness.** Instruments may ask for random volume/pan swing, and some
-  effects are randomised. The JS library draws those from `Math.random`; the C
-  library from a seeded mulberry32 (`cfg.random_seed`, default 1) or your own
-  `cfg.random` — so a render is reproducible, and is exactly the JS render when
-  the JS side is seeded the same way (`setRandomSource(makeSeededRandom(1))`).
+  effects are randomised. Those draw from a seeded mulberry32
+  (`cfg.random_seed`, default 1) or your own `cfg.random` — so a render is
+  reproducible. (The tracker and the JS library seed the same generator
+  at random, which is what swing is for; seeded alike —
+  `setRandomSource(makeSeededRandom(1))` there — they render exactly this.)
 - **Speed.** About 50× real time on one core of a desktop x86-64 for an ordinary
   32-lane song (`-O2`), ~25× for a dense one full of metainstruments and SF2
   filters.
@@ -236,39 +238,35 @@ afresh, so the same floats always make the same file.
 ## Numerics
 
 The engine does its arithmetic in binary64 and narrows the mix to binary32 once
-per frame, exactly where the JavaScript does; every expression keeps the
-reference's order of operations.
+per frame; the order of every sum is part of the result, which is why the
+library must be built without fused multiply-adds and without fast-math.
 
-V8 computes `Math.sin`, `cos`, `tan`, `exp`, `log`, `log10`, `log2`, `acos`,
-`asin`, `atan2`, `tanh`, `log1p`, `expm1` and `pow` (and `**`) with its own
-fdlibm port, and the C
-library's versions differ from it in the last bit for a few per cent of
-arguments — enough to move a sample by one binary32 ulp here and there. So
-[`src/jsmath.c`](src/jsmath.c) carries the fdlibm functions, verified
-bit-for-bit against V8 over millions of arguments (`tests/jsmath_check`). That
-also makes the output independent of the target's libm.
+It also brings its own mathematics. The engine was first written in JavaScript,
+and its numbers were defined by what V8 computes for `Math.sin`, `cos`, `tan`,
+`exp`, `log`, `log10`, `log2`, `acos`, `asin`, `atan2`, `tanh`, `log1p`,
+`expm1` and `pow`: V8's own fdlibm port, which a platform's libm differs from
+in the last bit for a few per cent of arguments — enough to move a sample by
+one binary32 ulp here and there. [`src/jsmath.c`](src/jsmath.c) carries those
+functions, verified bit-for-bit against V8 over millions of arguments
+(`tests/jsmath_check`), so the output does not depend on the target's libm:
+the same bits from a desktop, a phone, a console and a browser.
 
 `pow` follows V8's copy exactly, including the one place it groups the final
 step differently from Sun's original, which moves about 4% of results by an
-ulp. Current V8 (14.x, as in Node 26) no longer calls that copy by default,
-though: with its `use_std_math_pow` flag on, the default, `Math.pow` and `**`
-are the platform's `std::pow`, so the JavaScript's own output now depends on
-the machine it runs on. V8 still computes its fdlibm port under
-`--no-use-std-math-pow`, and the tests run Node with that flag (`make check`
-and the scripts add it whenever Node knows it). A JS render made without it
-differs from this library's by an occasional one-ulp `pow` result, far below
-anything audible.
+ulp. (Current V8 — 14.x, as in Node 26 — calls the platform's `std::pow`
+instead unless run with `--no-use-std-math-pow`; `tests/jsmath_check` runs Node
+with that flag.)
 
 `-DTAUD_LIBM_POW` (CMake: `-DTAUDPLAY_LIBM_POW=ON`) uses the platform's `pow`
-instead, which is bit-exact against a default V8 on the same machine where both
-call the same libm (verified on Linux with glibc 2.44 over the whole corpus),
-at the cost of the output's platform independence.
+instead, at the cost of the output's platform independence: such a build is no
+longer bit-identical to the tracker.
 
 ## Verification
 
 `make check` (needs Node ≥ 22 and a checkout of the JS library at
-`../microtone-taudplay`, or `JS=path`; Node runs with `--no-use-std-math-pow`
-where it has the flag, see [Numerics](#numerics)) runs:
+`../microtone-taudplay`, or `JS=path`) compares this build with the JS
+library, which runs the same sources as WebAssembly: what it proves is that
+your compiler and your platform produce the engine's bits. It runs:
 
 - `tests/jsmath_check` — the math functions against V8.
 - `tests/wavcheck` — the WAV encoder, clean and gritty, at the engine rate and
@@ -319,30 +317,27 @@ At the time of writing all of it is bit-identical against Node 26 (V8 14.6):
 the seventeen files of the Microtone corpus and demos (every song, both monitor
 modes), and hundreds of fuzzed songs.
 
-## Relationship to the JS library
+## Relationship to Microtone and the JS library
 
-This is a port of `core/engine`, `core/format`, `core/audio/offline-render.js`
-and `src/taudplay/render.js` — the `TaudRenderer` half. The browser half
-(`TaudPlayer`, the AudioWorklet) has no C counterpart: its job, pulling blocks
-from an audio callback, is `taud_render`. Source files mirror the JS modules one
-for one (`sampler.c` is `sampler.js`, `tick.c` is `tick.js`, `opl.c` is
-`opl.js`, `psg.c` is `psg.js`, `formant.c` is `formant.js`, …) and keep their
-function names, so the two can be diffed when the engine moves. (`chip.js`,
-which dispatches between the two chip kinds, is folded into `formant.c`;
-`imix.c` is `imix.js` and the decoder half of `imix-section.js`, and the
-biquad, compressor and limiter it shares with the master bus live in
-`mastering.c`, as they do in `mastering.js`; the multiband split the
-compressor and the transient shaper share is `ImxSplit`, and the windowed peak
-the shaper and the expander detect with is `ImxPeakWin`, both as in `imix.js`.
-The JavaScript mixer runs a chunk
-in spans between ticks; this one runs a frame at a time and finishes each span
-— the instrument buses, the fold-down, the Amiga filters — just before the
-tick that ends it, which adds everything in the same order.)
+These sources are `core/engine/c/` of the
+[Microtone repository](https://github.com/Microtone-project/Microtone.js),
+copied (`tools/make-taudplay-c.js` there); the engine is developed in that
+tree, and the tracker's golden renders are its contract. Up to version 4.10
+the engine was JavaScript and this library was its port, file for file —
+`sampler.c` was `sampler.js`, `tick.c` was `tick.js` — which is where the
+layout and the function names come from.
 
-In step with taudplay 4.10.0 (Microtone.js 4.10.0, engine 25b432cfdc38). The
-engine's chase (`chase.js`, `TaudEngine.chaseTrackerRow`) is not ported: the
-`TaudRenderer` this library mirrors does not use it, and seeking here is
-`taud_seek_cue`, as it is there.
+The library's surface is `include/taudplay.h` and `src/player.c`: the
+`TaudRenderer` half of the JS library. Its browser half (`TaudPlayer`, the
+AudioWorklet) has no counterpart here: its job, pulling blocks from an audio
+callback, is `taud_render`.
+
+`src/` also holds what only the WebAssembly build is made of, which the
+library does not compile: `wasm_api.c` (the calls a browser host makes —
+uploads, jam voices, meters), `snapshot.c` (the state block the tracker's
+display reads) and `wasm_parts.c` (hooks for the tracker's tests).
+
+In step with taudplay 5.0.0 (Microtone.js 5.0.0, engine 74c9468d1933).
 
 ## Licence
 

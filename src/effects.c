@@ -583,7 +583,7 @@ static void apply_filter_param_effect(TaudEngine *e, TaudVoice *voice, int vi, i
         if (isResonance) ti->resonanceOverride = value;
         else ti->cutoffOverride = value;
     }
-    for (i = 0; i < MAX_VOICES; i++) if (e->voices[i].active) filter_param_push(e, &e->voices[i], &targets, isResonance);
+    for (i = 0; i < TOTAL_VOICES; i++) if (e->voices[i].active) filter_param_push(e, &e->voices[i], &targets, isResonance);
     for (i = 0; i < e->bgCount; i++) if (e->bg[i]->active) filter_param_push(e, e->bg[i], &targets, isResonance);
 }
 
@@ -609,4 +609,10 @@ int te_apply_retrig_vol_mod(int vol, int x, int step, int max)
     default: v = vol; break;
     }
     return iclamp(v, 0, max);
+}
+
+/* The cutoff / resonance override on its own (wasm_parts.c). */
+void te_apply_filter_param_effect(TaudEngine *e, TaudVoice *voice, int vi, int rawArg, bool isResonance)
+{
+    apply_filter_param_effect(e, voice, vi, rawArg, isResonance);
 }

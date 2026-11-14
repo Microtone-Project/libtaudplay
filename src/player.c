@@ -1,7 +1,6 @@
 /* The public surface — port of taudplay/render.js (TaudRenderer), faders.js
  * and interrupts.js. Same file, same songs, same knobs, same two probes. */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -137,8 +136,19 @@ TaudPlayer *taud_open(const void *bytes, size_t len, const TaudConfig *cfgIn, Ta
             p->songNames[i] = (char *)malloc(strlen(nm) + 1);
             if (p->songNames[i] != NULL) strcpy(p->songNames[i], nm);
         } else {
-            p->songNames[i] = (char *)malloc(16);
-            if (p->songNames[i] != NULL) snprintf(p->songNames[i], 16, "song %d", i);
+            /* "song N", written by hand: printf would be the engine's only
+             * use of stdio, and a WebAssembly build must import nothing. */
+            char *s = (char *)malloc(16);
+            p->songNames[i] = s;
+            if (s != NULL) {
+                char digits[10];
+                int n = 0, v = i;
+                memcpy(s, "song ", 5);
+                s += 5;
+                do { digits[n++] = (char)('0' + v % 10); v /= 10; } while (v > 0);
+                while (n > 0) *s++ = digits[--n];
+                *s = 0;
+            }
         }
     }
     p->engine->random = cfg.random;
@@ -388,10 +398,11 @@ size_t taud_render_s16(TaudPlayer *p, int16_t *out, size_t frames)
 static void wr16(uint8_t *b, unsigned v) { b[0] = (uint8_t)v; b[1] = (uint8_t)(v >> 8); }
 static void wr32(uint8_t *b, uint32_t v) { wr16(b, v & 0xffff); wr16(b + 2, v >> 16); }
 
-/* The clean WAV's 16-bit quantiser (dither.js in the JS library): clamp,
- * scale by 32767, add a triangular -1…+1 LSB, round. The two draws are
+/* The clean WAV's 16-bit quantiser (the JS library's encodeWav calls this file's encoder): clamp,
+ * scale by 32767, add a triangular -1…+1 LSB, round. (The Mastering view's
+ * 16-bit census runs it too, meters.c.) The two draws are
  * separate statements because C leaves the order of a - b's operands open. */
-static int16_t dither_s16(uint32_t *xs, float v)
+int16_t te_dither_s16(uint32_t *xs, float v)
 {
     double d = v < -1.0f ? -1.0 : v > 1.0f ? 1.0 : (double)v;
     double a = (double)(te_xorshift32(xs) & 0xffffff);
@@ -446,7 +457,7 @@ uint8_t *taud_encode_wav_quality(const float *interleaved, size_t frames, int sr
             te_dither_u8(&xs, err, l, r, n, buf + 44 + f0 * 2);
         }
     } else {
-        for (i = 0; i < numSamples; i++) wr16(buf + 44 + i * 2, (uint16_t)dither_s16(&xs, pcm[i]));
+        for (i = 0; i < numSamples; i++) wr16(buf + 44 + i * 2, (uint16_t)te_dither_s16(&xs, pcm[i]));
     }
     free(resampled);
     *out_len = 44 + dataBytes;

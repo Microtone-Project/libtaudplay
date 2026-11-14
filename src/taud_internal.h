@@ -52,6 +52,13 @@
 #define SAMPLEINST_SIZE (SAMPLE_BIN_TOTAL + INSTBIN_SIZE)
 #define NUM_VOICES 32
 #define MAX_VOICES 64
+/* The jam bank (item 140): voices of the editor's own above the lanes, which
+ * an auditioned note sounds on without displacing a song voice. The tick and
+ * mix passes walk all TOTAL_VOICES; only what is LANE-scoped stops at
+ * JAM_VOICE_BASE. A player never triggers one, so they stay silent there. */
+#define JAM_VOICES 16
+#define JAM_VOICE_BASE MAX_VOICES
+#define TOTAL_VOICES (MAX_VOICES + JAM_VOICES)
 #define NUM_CUES 8192
 #define NUM_PATTERNS 0x7fff
 #define PATTERN_EMPTY 0x7fff
@@ -74,6 +81,7 @@
 #define SINC_WIDTH 3
 #define SINC_PRECISION 1024
 #define SINC_TABLE_SIZE (SINC_PRECISION * SINC_WIDTH)
+#define SINC_TAPS (SINC_WIDTH * 2)   /* the taps a phase in [0, 1) reaches: −2…+3 */
 
 #define NUM_INTERRUPTS 16
 #define AUDITION_SLOT 1024
@@ -172,7 +180,18 @@ double js_fdlibm_pow(double x, double y);
 /** Math.fround. */
 static inline double fround(double x) { return (double)(float)x; }
 
+/* A function the WebAssembly module exports under `name` (wasm_api.c, the
+ * host's calls; wasm_parts.c, the engine's parts for the tests). Nothing
+ * elsewhere. */
+#if defined(__wasm__)
+#define TW_EXPORT(name) __attribute__((export_name(#name)))
+#else
+#define TW_EXPORT(name)
+#endif
+
 /* ── instrument model (inst.js) ────────────────────────────────────────── */
+
+struct TaudEngine;
 
 typedef struct { uint8_t value, offset; } TaudEnvPoint;
 
@@ -183,6 +202,10 @@ typedef struct { uint8_t value, offset; } TaudEnvPoint;
 
 typedef struct {
     int pitchStart, pitchEnd, volumeStart, volumeEnd;
+    /* The pitch extension (§9.18, pitchext.c): what the instrument's `IPit`
+     * entry adds to the three 16-bit pitch fields, in 4096-TET units; 0
+     * without one. dHi is added to the EXCLUSIVE end of the range, pitchEnd + 1. */
+    double dLo, dHi, dDetune;
     uint32_t samplePtr;
     int sampleLength, playStart, loopStart, loopEnd, samplingRate, sampleDetune;
     int loopMode, defaultPan, defaultNoteVolume;
@@ -210,6 +233,14 @@ typedef struct {
  * IMix id (item 217) and byte 254 stays clear (FM_PROGRAM_END). */
 #define FM_PROGRAM_END 254
 #define FM_STACK_MAX 16
+/* A rack runs at the smallest whole multiple of the engine's rate that
+ * reaches FM_OVERSAMPLE_RATE (at most FM_OVERSAMPLE_MAX times it), and comes
+ * down through an eighth-order Butterworth low-pass — FM_DEC_SECTIONS
+ * biquads — at FM_DEC_CUTOFF of the engine's rate. */
+#define FM_OVERSAMPLE_RATE 192000
+#define FM_OVERSAMPLE_MAX 8
+#define FM_DEC_SECTIONS 4
+#define FM_DEC_CUTOFF 0.45
 #define FM_WORD_OSC 0x0000
 #define FM_WORD_MOD 0x0400
 #define FM_WORD_FB 0x0800
@@ -225,11 +256,17 @@ typedef struct {
 typedef struct {
     int instIdx, mixOctet, detune, pitchStart, pitchEnd, volStart, volEnd;
     bool fixedPitch;
+    int srcIndex;               /* which entry of the record this is (some are dropped) */
+    double dLo, dHi, dDetune;   /* the pitch extension, as a patch's (§9.18) */
 } TaudMetaLayer;
 
 typedef struct {
     int count;
     TaudMetaLayer layers[META_MAX_LAYERS];
+    /* Every entry the record has, usable or not — its count byte and the six
+     * pitch bytes of each (+2…+7): what an `IPit` guard is computed over. */
+    int rawCount;
+    uint8_t rawPitch[META_MAX_LAYERS * 6];
     uint8_t flags;              /* record byte 0 */
     uint8_t imixId;             /* record byte 255: the IMix block (§9.15) */
     bool strict;
@@ -266,6 +303,7 @@ typedef struct {
     int kind;
     bool deepTremolo, deepVibrato, nts, lowFnum;
     int feedback, cntA, cntB, partnerMult, partnerDetune;
+    double dPartnerDetune;      /* the pitch extension of partnerDetune (§9.18) */
     TaudOplOperator ops[4];
     int outputs;
 } TaudOplPatch;
@@ -365,6 +403,7 @@ typedef struct TaudFormantPatch {
     int srcInst;                /* the header's source instrument, 0 = the sample */
     int front, open, round, track, glide, timing;
     int refNote;                /* bits 0…14 of the word; 0 = the syllable has no vowel */
+    double dRefNote;            /* the pitch extension of refNote (§9.18) */
     bool nasal;                 /* bit 15: the vowel nasalised */
     int semivowel;
     bool rhotic;
@@ -530,6 +569,8 @@ typedef struct TaudInst {
     int dupCheckFlag, defaultNoteVolume, pf2EnvLoop, pf2EnvSustainWord;
     uint8_t reserved[5];
     int initialAttenOctet;
+    /* The pitch extension of sampleDetune and pitchPanCentre (§9.18); 0 without one. */
+    double dSampleDetune, dPitchPanCentre;
 
     int cutoffOverride, resonanceOverride;
 
@@ -572,6 +613,11 @@ typedef struct TaudInst {
     int modExtSwapA, modExtSwapB;
     bool modExtMirror;
     int modFunkWalk, modFunkPos, modFunkLen;
+
+    /* The engine this instrument belongs to, for te_retire: a record reload
+     * replaces objects a sounding voice may still point at. NULL = none
+     * (replaced objects are then freed at once). */
+    struct TaudEngine *engine;
 } TaudInst;
 
 static inline bool inst_is_meta(const TaudInst *i) { return i->meta != NULL; }
@@ -698,6 +744,13 @@ typedef struct {
     const uint16_t *program;
     int programLen;
     double stack[FM_STACK_MAX + 2];
+    /* Oversampling (spec §5.5.1 "The rack's own rate"): what an operator's
+     * per-frame chain made of its gain, and a chip operator's value, both
+     * held over the frame's sub-steps; and the state of the low-pass the
+     * rack comes down through, two numbers a section. */
+    double opGain[FM_MAX_OPERATORS];
+    double held[FM_MAX_OPERATORS];
+    double dec[FM_DEC_SECTIONS * 2];
 } TaudFmRig;
 
 /* Renderer gains for a voice's (at most two) sample channels. */
@@ -706,7 +759,7 @@ typedef struct {
     double az, el;
     int chans;
     unsigned rendererGen;
-    double gains[2 * 16];
+    double gains[2 * 17];       /* 2 sample channels × SPATIAL_MAX_CHANNELS */
 } TaudSpatialCache;
 
 struct TaudVoice {
@@ -725,14 +778,14 @@ struct TaudVoice {
 
     bool isLayerChild;
     double layerRelDetune;
-    int layerFixedNote;
+    double layerFixedNote;      /* −1 = not fixed; else the pitch, inside the cell's range */
     double layerRelPan, layerRelElevation;
     double layerMixGain;
     double layerPitchMod;
     int nnaOverride;
     bool volEnvOn, panEnvOn, pitchEnvOn, filterEnvOn;
     bool metaForeground;
-    int metaForegroundDetune;
+    double metaForegroundDetune;
     bool noteFading;
 
     TaudFmRig *fmRig;            /* NULL, or &rigStore */
@@ -766,6 +819,7 @@ struct TaudVoice {
     double spatialTargetAz, spatialTargetEl;
     bool spatialSlideActive;
     TaudSpatialCache spatial;
+    TaudSpatialCache analysisSpatial;   /* …and the master-strip analysis bus's own */
 
     double currentMixVolume;
     int volRampSamples;
@@ -804,7 +858,13 @@ struct TaudVoice {
 
     uint32_t activeSamplePtr;
     int activeSampleLength, activeSamplePlayStart, activeSampleLoopStart, activeSampleLoopEnd;
-    int activeSamplingRate, activeSampleDetune, activeLoopMode;
+    int activeSamplingRate, activeLoopMode;
+    double activeSampleDetune;
+    /* How far the pitch this voice SOUNDS lies outside the sixteen octaves a
+     * note value can hold: a layer or an operator whose detune (or fixed
+     * note) takes it there keeps noteVal at the nearest end and carries the
+     * rest here, into the playback rate (§9.18). 0 for any other voice. */
+    double pitchExcess;
     int activeVibratoSpeed, activeVibratoSweep, activeVibratoDepth, activeVibratoRate;
     int activeVibratoWaveform;
     int activeChanCount, activeChanMode;
@@ -834,6 +894,10 @@ struct TaudVoice {
     bool filterIsBiquad;
     double filterBqB02, filterBqB1, filterBqA1, filterBqA2, filterX1, filterX2;
     int filterCutoffCached, filterResonanceCached;
+    /* How many times a frame this voice's filter runs: an FM operator past
+     * the first is filtered at its rack's rate, so its coefficients are made
+     * for that rate. 0 or 1 = the engine's own. */
+    int filterOversample;
     /* SoundFont-mode filter glide (te_advance_filter_glide): cutoff in cents
      * and Q where they stand, per-sample steps, samples left, the refresh's
      * targets. sfCents NaN = the next refresh lands at once. */
@@ -927,7 +991,7 @@ struct TaudVoice {
 /* One pattern cell, either wire layout (8-byte v1/2 or 16-byte v3). Kept
  * small: a song holds hundreds of 64-row patterns. The note is stored as it
  * arrives — the word, and a wide cell's fine nibble (byte 13's high nibble,
- * the four bits that make its pitch 65536-TET, file format §5.5) — and read
+ * the four bits that make its pitch 65536-TET, file format §5.1) — and read
  * through te_cell_note. */
 typedef struct {
     uint16_t note;
@@ -936,14 +1000,20 @@ typedef struct {
     int8_t elevation;
     uint8_t effect2;
     uint16_t effectArg2;
-    uint8_t noteFine;           /* 0..15; always 0 in a narrow cell */
+    uint8_t noteFine;           /* 0..15: byte 13's nibble as a wide decode last left it */
+    /* The sixteenths the note CARRIES — the reference keeps one number, word
+     * plus fraction, and these are its fraction: the nibble under a wide
+     * decode (none under a sentinel word), and none at all once a narrow
+     * decode has written a note byte. A pattern slot is reused across files,
+     * so a narrow song can be decoded into cells a wide one left its nibbles
+     * in; reading noteFine itself would then bend the narrow song's pitch. */
+    uint8_t noteFrac;
 } TaudCell;
 
-/* The cell's note in 4096-TET units: the word plus sixteenths. A sentinel
- * word (< $20) takes no fraction (the nibble is RESERVED under one). */
+/* The cell's note in 4096-TET units: the word plus the sixteenths it carries. */
 static inline double te_cell_note(const TaudCell *c)
 {
-    return c->note >= 0x20 ? c->note + c->noteFine / 16.0 : (double)c->note;
+    return c->note + c->noteFrac / 16.0;
 }
 
 #define INST_NOP 0
@@ -964,7 +1034,7 @@ typedef struct {
 #define CUE_BLOCK 256
 #define CUE_BLOCKS (NUM_CUES / CUE_BLOCK)
 
-/* ── spatial bus / renderers (spatial.js, binaural.js) ─────────────────── */
+/* ── spatial bus / renderers (spatial.c, binaural.c) ──────────────────── */
 
 typedef struct {
     bool sphere;
@@ -977,11 +1047,35 @@ typedef struct {
     int histPos;
 } TaudBinaural;
 
+/* The widest bus: the analysis target's nine scope harmonics and a 7.1
+ * layout's eight speaker feeds after them. */
+#define SPATIAL_MAX_CHANNELS 17
+#define SCOPE_CHANNELS 9        /* second-order ACN/SN3D (analysis.js) */
+#define SPEAKER_MAX 8
+
+/* The render targets an object bus can feed (spatial.js's renderers). */
+#define RENDER_STEREO 0         /* the device's fold onto the stereo pan law */
+#define RENDER_BINAURAL 1       /* the head model */
+#define RENDER_ANALYSIS 2       /* the master strip's: scope harmonics + speakers */
+#define RENDER_AMBISONIC 3      /* SN3D to an order, the export basis */
+#define RENDER_SPEAKERS 4       /* a speaker layout's feeds */
+
 typedef struct {
-    int kind;                   /* 0 = stereo fold, 1 = binaural */
+    int kind;                   /* RENDER_* */
     TaudBinaural *bin;
     int numChannels;
-    double data[16 * TRACKER_CHUNK];
+    /* A speaker layout (speakers.js SpeakerRenderer; kinds 2 and 4): the
+     * non-LFE speakers as a ring sorted by azimuth, and each speaker folded
+     * to stereo as if it were itself a source. spkCount 0 = no layout. */
+    int spkCount, ringSize;
+    int ringChannel[SPEAKER_MAX];
+    double ringAz[SPEAKER_MAX];
+    double monitorGains[SPEAKER_MAX * 2];
+    /* An ambisonic target (kind 3): its order and the ACN of each channel —
+     * a planar one drops the harmonics a horizontal song cannot excite. */
+    int order;
+    int acn[16];
+    double data[SPATIAL_MAX_CHANNELS * TRACKER_CHUNK];
 } TaudSpatialBus;
 
 /* ── mastering (mastering.js) ──────────────────────────────────────────── */
@@ -1095,10 +1189,21 @@ void te_mastering_default(TaudMastering *p);
 bool te_mastering_engaged(const TaudMastering *p);
 bool te_mastering_parse_block(const uint8_t *b, size_t len, TaudMastering *out);
 TaudMasterChain *te_master_chain_new(const TaudMastering *p, int rate);
+/* The same chain over a CHANNEL-MAJOR bus `nch` wide (an export's speaker
+ * feeds or ambisonic scene, engine spec §12.3): every channel filtered alike,
+ * one dynamics detector reading all of them, and the width stage scaling an
+ * ambisonic scene's directional channels against W (skipped on speakers). */
+TaudMasterChain *te_master_chain_new_planar(const TaudMastering *p, int rate, int nch, bool ambisonic);
+void te_master_chain_process_planar(TaudMasterChain *c, double *data, int frames, int stride);
+int te_master_chain_channels(const TaudMasterChain *c);
+int te_master_chain_latency(const TaudMasterChain *c);
 void te_master_chain_free(TaudMasterChain *c);
 void te_master_chain_set_params(TaudMasterChain *c, const TaudMastering *p);
 void te_master_chain_reset(TaudMasterChain *c);
 void te_master_chain_process(TaudMasterChain *c, float *left, float *right, int frames);
+/** The last chunk's deepest gain reduction, dB (≤ 0); 0 with no chain. */
+double te_master_chain_comp_gr(const TaudMasterChain *c);
+double te_master_chain_lim_gr(const TaudMasterChain *c);
 
 /* ── instrument mixing chains (imix.js, imix-section.js) ───────────────── */
 
@@ -1159,6 +1264,29 @@ typedef struct {
 
 typedef struct TaudImxChain TaudImxChain;
 
+/* One voice's contribution to one frame, as the stem exporter routes it: the
+ * lane it belongs to (a ghost's is the lane that spawned it), the instrument
+ * the pattern named and the one actually sounding, and its Ixmp patch. */
+typedef struct TaudStemEntry {
+    int32_t frame, lane, top, sub, patch, pad;
+    double value;
+} TaudStemEntry;
+
+/* ── the Mixing tab's meter tap (imix.js ImixMeterTap; imixtap.c) ── */
+
+#define IMX_RING_FRAMES 2048
+#define IMX_METER_SEATS 2
+#define IMX_TAP_STAGE_COUNT 6   /* EQU1, DEQ1, TSH1, COMP, EQU2, DEQ2 */
+
+/* A chain's gain reductions over a span (InstrumentChain.readGr). */
+typedef struct {
+    double comp[IMX_COMP_MAX_BANDS], deq1[IMX_DEQ_BANDS], deq2[IMX_DEQ_BANDS], tsh1[IMX_TSH_MAX_BANDS];
+    double expd, expdLvl, lim;
+    double compLvl[IMX_COMP_MAX_BANDS], deq1Lvl[IMX_DEQ_BANDS], deq2Lvl[IMX_DEQ_BANDS];
+} TaudImxGr;
+
+struct TaudImixTap;
+
 /* One bus on the playhead (InstrumentBus): a chunk of channel-major binary64
  * in the song's own channel layout — `sb` is filled the way the master object
  * bus is, through the same renderer gains — and the chain that runs over it.
@@ -1183,12 +1311,120 @@ typedef struct {
 int te_imix_parse_section(const uint8_t *b, size_t len, TaudImixBlock **out);
 bool te_imix_block_engaged(const TaudImixBlock *b);
 TaudImxChain *te_imx_chain_new(const TaudImixBlock *block, int rate, int nch, bool stereo, bool ambisonic);
+int64_t te_imx_lfo_increment(bool sync, uint32_t rate, int bpm, int fs);
 void te_imx_chain_free(TaudImxChain *c);
 void te_imx_chain_set_block(TaudImxChain *c, const TaudImixBlock *block);
 void te_imx_chain_reset(TaudImxChain *c);
 void te_imx_chain_note_on(TaudImxChain *c);
 bool te_imx_chain_idle(const TaudImxChain *c);
 void te_imx_chain_process(TaudImxChain *c, double *data, int stride, int n0, int n1, int bpm, bool fed);
+void te_imx_chain_set_probes(TaudImxChain *c, struct TaudImixTap *a, struct TaudImixTap *b);
+void te_imx_chain_read_gr(const TaudImxChain *c, TaudImxGr *out);
+bool te_imx_chain_unison_now(const TaudImxChain *c, double *cents, double *width);
+
+/* What the Mixing tab draws for ONE instrument's bus: level figures on both
+ * sides of the chain, the chain's gain reductions, a stereo ring after the
+ * chain and a mono ring before it, a mono ring at the input of each tapped
+ * piece, and the unison's detune and width. It exists only while the view
+ * that reads it is up. */
+typedef struct TaudImixTap {
+    int slot;
+    float ring[IMX_RING_FRAMES * 2], ringPre[IMX_RING_FRAMES];
+    int write, preWrite;
+    TaudTruePeakProbe probes[4];
+    double tpCoef[TP_PHASES * TP_TAPS];
+    double peak[4], truePeak[4], sumSq[4], clip[4];
+    int frames;
+    TaudImxGr gr;
+    float stageRings[IMX_TAP_STAGE_COUNT][IMX_RING_FRAMES];
+    int stageWrite[IMX_TAP_STAGE_COUNT];
+    const TaudImixBus *bus;
+    bool unisLive;
+    double unisCents, unisWidth;
+} TaudImixTap;
+
+/* imixtap.c */
+void te_set_imix_meter(struct TaudEngine *e, int slot, int seat);
+void te_imix_tap_reset_all(TaudImixTap *t);
+void te_imix_tap_push_pre(TaudImixTap *t, const TaudImixBus *bus, int n0, int n1);
+void te_imix_tap_stage_in(TaudImixTap *t, int kind, int n0, int n1);
+void te_imix_tap_push_post(TaudImixTap *t, const TaudImixBus *bus, int n0, int n1);
+void te_fill_imix_meters(struct TaudEngine *e, float *f);
+void te_tp_coef(double h[TP_PHASES * TP_TAPS]);
+double te_tp_push(TaudTruePeakProbe *pr, const double *coef, double v);
+
+/* ── the master bus's meters (meters.c; analysis.js, loudness.js) ──────── */
+
+#define SCOPE_FRAMES 4096       /* the strip's B-format ring, frames */
+#define ANALYSIS_MAX_METERS 8   /* the widest metered set (7.1) */
+/* Metering targets (analysis.js ANALYSIS_*): the pair, the encoded field, a
+ * speaker layout (then 1…3: quad, 5.1, 7.1 in speakers.js's order). */
+#define AN_TARGET_STEREO 0
+#define AN_TARGET_AMBISONIC 1
+#define AN_TARGET_SPEAKERS 2
+/* te_analysis_drain's readout: meterCount, frames, field energy, the three
+ * correlation sums, the ring cursor, then per meter (ANALYSIS_MAX_METERS
+ * each) peak, true peak, mean square, clips. */
+#define AN_READOUT (7 + 4 * ANALYSIS_MAX_METERS)
+
+#define MM_STAGES 2             /* before the mastering chain, after it */
+#define MM_TAP_PRE 0
+#define MM_TAP_POST 1
+#define MM_SPEC_FRAMES 2048     /* loudness.js SPEC_FRAMES */
+#define MM_HIST_BUCKETS 256
+#define AP_SECTIONS 8           /* the phase scrambler's all-pass sections */
+/* te_master_meter_drain's readout (wasm-engine.js mirrors these): */
+#define MM_R_FRAMES 0
+#define MM_R_COMP_GR 1
+#define MM_R_LIM_GR 2
+#define MM_R_SUM_Z 3            /* per stage */
+#define MM_R_PEAK 5             /* per stage × channel, stage-major */
+#define MM_R_TRUE_PEAK 9
+#define MM_R_MEAN_SQUARE 13
+#define MM_R_CLIP 17
+#define MM_R_AP_PEAK 21         /* per stage */
+#define MM_R_AP_SUM_SQ 23
+#define MM_R_BIT_DEPTH 25
+#define MM_R_HIST_SPAN 26
+#define MM_R_SPEC_WRITE 27
+#define MM_R_BITS 28            /* te_bit_usage's eight */
+#define MM_R_BUCKETS 36         /* MM_HIST_BUCKETS raw counts */
+#define MM_READOUT (MM_R_BUCKETS + MM_HIST_BUCKETS)
+
+typedef struct TaudAnalysisTap TaudAnalysisTap;
+typedef struct TaudMasterMeter TaudMasterMeter;
+
+void te_set_analysis(struct TaudEngine *e, int target, int layout);
+TaudAnalysisTap *te_analysis_tap_new(int target, int layout, int model);
+void te_analysis_finish(TaudAnalysisTap *t, const double *bus, const float *mixL, const float *mixR, int frames);
+int te_analysis_meter_count(const TaudAnalysisTap *t);
+int te_analysis_meter_source(const TaudAnalysisTap *t);
+bool te_analysis_needs_bus(const TaudAnalysisTap *t);
+int te_analysis_layout(const TaudAnalysisTap *t);
+void te_master_meter_set_span(TaudMasterMeter *t, int span);
+void te_analysis_drain(TaudAnalysisTap *t, double *out);
+const float *te_analysis_ring(const TaudAnalysisTap *t);
+void te_set_master_meter(struct TaudEngine *e, bool on, bool scramble, int bitDepth, int histSpan);
+TaudMasterMeter *te_master_meter_new(double rate, bool scramble, int bitDepth);
+void te_master_meter_free(TaudMasterMeter *t);
+void te_master_meter_reset_all(TaudMasterMeter *t);
+void te_master_meter_push(TaudMasterMeter *t, int stage, const float *left, const float *right, int frames);
+void te_master_meter_bin(TaudMasterMeter *t, const uint8_t *u8, const float *left, const float *right, int frames);
+void te_master_meter_drain(TaudMasterMeter *t, double *out);
+void te_master_meter_census(TaudMasterMeter *t, int span, double bits[8], double *buckets);
+const float *te_master_meter_rings(const TaudMasterMeter *t);
+const float *te_master_meter_pairs(const TaudMasterMeter *t);
+int te_master_meter_depth(const TaudMasterMeter *t);
+const double *te_master_meter_hist(const TaudMasterMeter *t, int span);
+void te_bit_usage(const double *hist, int depth, double out[8]);
+void te_kw_coefficients(double rate, double shelf[5], double hp[5]);
+double te_kw_run(const double *s, const double *h, double st[8], double x);
+void te_ap_coefficients(double rate, double c[AP_SECTIONS][4]);
+double te_ap_run(const double c[AP_SECTIONS][4], double st[AP_SECTIONS][4], double x);
+void te_meters_after_render(struct TaudEngine *e);
+void te_fill_meters(struct TaudEngine *e, float *f);
+/* The clean WAV export's 16-bit quantiser (player.c). */
+int16_t te_dither_s16(uint32_t *xs, float v);
 
 /* ── the engine (engine.js + state.js Playhead/TrackerState) ───────────── */
 
@@ -1273,6 +1509,12 @@ typedef struct TaudEngine {
     int surroundModel;
     int monitorMode;
     bool isPlaying;
+    /* An audition is sounding with the transport stopped: the host keeps
+     * rendering for it, and the mixer clears this once it has rung out. */
+    bool jamActive;
+    /* A lyric instrument jammed sings its lyrics on over the whole jam bank,
+     * so the place is the playhead's, kept per instrument (item 280). */
+    int jamLyricInst, jamLyricPos;
 
     /* TrackerState. */
     int cuePos, rowIndex, tickInRow;
@@ -1281,7 +1523,7 @@ typedef struct TaudEngine {
     int64_t oplFrame;           /* the OPL chip clock: frames mixed since reset */
     int psgQuarter;             /* the quarter of the tick the PSG auto-advance has reached */
     bool hasPsg;                /* some instrument is a PSG one (else no voice can sound a pair) */
-    TaudVoice voices[MAX_VOICES];
+    TaudVoice voices[TOTAL_VOICES];
     int toneMode, interpolationMode;
     bool ledFilterOn;
     bool ts_wideCells;
@@ -1291,9 +1533,25 @@ typedef struct TaudEngine {
     TaudSpatialBus *spatial;    /* NULL for the stereo model */
     TaudBinaural *binaural;     /* kept across model switches */
     unsigned rendererGen;
+    /* A render target an exporter installed in place of the device's monitor
+     * (setSpatialRenderer): its kind, or −1 for none, and its parameters. */
+    int rendererKind, rendererOrder, rendererLayout;
+    bool rendererPlanar;
+    /* The master strip's analysis bus (item 98): a SECOND object bus through
+     * the analysis target, fed with every voice the monitor's is while a
+     * surround song's strip is on screen; NULL otherwise. */
+    TaudSpatialBus *analysisBus;
+    unsigned analysisGen;
+    /* …and the meters (meters.c): the strip's tap, the Mastering view's.
+     * NULL = off, and then they cost nothing. */
+    TaudAnalysisTap *analysisTap;
+    TaudMasterMeter *masterMeter;
     TaudMastering masteringParams;
     bool hasMasteringParams;
     TaudMasterChain *mastering;
+    /* A multichannel export's chain (setBusMastering): the song's chain run
+     * over the render target's bus instead of the pair; NULL = none. */
+    TaudMasterChain *busMastering;
     double tuningRatio;
     double amigaLPStateL, amigaLPStateR;
     double amigaLEDStateL[4], amigaLEDStateR[4];
@@ -1306,6 +1564,10 @@ typedef struct TaudEngine {
     unsigned pendingInterrupts;
     uint16_t interruptArgs[NUM_INTERRUPTS];
     float mixLeft[TRACKER_CHUNK], mixRight[TRACKER_CHUNK];
+    /* The mix as it goes INTO the mastering chain, kept only while a host's
+     * meter asks for it (preTap): the Mastering view reads both sides. */
+    bool preTap;
+    float preLeft[TRACKER_CHUNK], preRight[TRACKER_CHUNK];
 
     TaudVoice **bg;
     int bgCount, bgCap;
@@ -1325,7 +1587,20 @@ typedef struct TaudEngine {
     uint32_t mulberry;
 
     /* Tables. */
-    double sincTable[SINC_TABLE_SIZE];
+    /* The sinc kernel (engine spec §8.3): sincTable[i] is the Hann-windowed
+     * sinc at i ÷ SINC_PRECISION samples from the centre, and 0 at the last
+     * entry, where the window ends. sincPhase is the same numbers laid out
+     * for the sampler: row p holds the six coefficients of sub-sample phase
+     * p, for the taps −2…+3. */
+    double sincTable[SINC_TABLE_SIZE + 1];
+    double sincPhase[SINC_PRECISION * SINC_TAPS];
+    /* The FM racks' oversampling factor at this rate, and their low-pass:
+     * b0, b1, b2, a1, a2 of each section (a0 = 1), in the order they run. */
+    int fmOversample;
+    double fmDec[FM_DEC_SECTIONS][5];
+    /* An unsigned 8-bit sample as the mixer's number, (b − 127.5) / 127.5,
+     * for every b: the division done once (sampler.js PCM_U8). */
+    double pcmU8[256];
     TaudFormantTables formantTables;
     /* The PSG noises: one period of each shift register's output. */
     uint8_t psgNoiseLong[PSG_NOISE_LONG_LEN];
@@ -1342,6 +1617,14 @@ typedef struct TaudEngine {
     TaudImixBus **imixList;     /* ascending by slot */
     int imixCount, imixCap;
     uint8_t imixTrig[IMX_ROUTE_SLOTS];  /* a note started on the slot since its bus last ran */
+    /* The stem-export tap (item 93): while on, the mixer logs every voice's
+     * PRE-PAN mono contribution to each frame of the chunk, in the order it
+     * mixes them, and nothing else about the render changes. */
+    bool stemTap;
+    struct TaudStemEntry *stemLog;
+    int stemCount, stemCap;
+    /* The Mixing tab's taps (item 217), one per split pane; NULL = off. */
+    TaudImixTap *imixMeters[IMX_METER_SEATS];
     /* The frame accumulators the buses join (mixAccL/R): a span's frames are
      * finished only once every bus has run over it. */
     double accL[TRACKER_CHUNK], accR[TRACKER_CHUNK];
@@ -1351,6 +1634,24 @@ typedef struct TaudEngine {
     double gainSpan[TRACKER_CHUNK];
 
     bool oom;                   /* an allocation failed on the render path */
+
+    /* Instrument data that was replaced while voices may still point at it
+     * (te_retire): freed once no voice does. */
+    struct TaudRetired *retired;
+    int retiredCount, retiredCap, retireSweepAt;
+    size_t retiredBytes;
+
+    /* What the host API (wasm_api.c) holds on the engine's behalf. A player
+     * borrows all of this from its parsed document and leaves these NULL; a
+     * host that UPLOADS (the tracker) has no document, so the engine keeps
+     * the copies and frees them when they are replaced or it is. */
+    uint8_t *ownPool;
+    TaudImixBlock *ownImix;
+    /* The `IPit` entries (§9.18), by instrument slot; NULL = no section. An
+     * entry is applied to its instrument whenever either is (re)loaded. */
+    struct TaudPitchExt **pitchExt;
+    TaudLyricEntry *ownLyrics;
+    int ownLyricCount;
 } TaudEngine;
 
 /* engine.c */
@@ -1360,6 +1661,15 @@ static inline int te_pool_at(const TaudEngine *e, int64_t p)
 }
 
 TaudEngine *te_engine_new(int rate);
+/** Give up `p` (`size` bytes, malloc'd) without freeing it under a voice that
+ *  still points into it: it joins the retired list, which te_retire_sweep
+ *  empties of everything no voice can reach. The JavaScript engine left this
+ *  to its garbage collector; a host that re-uploads an instrument while its
+ *  notes sound needs the same. NULL is ignored; a NULL engine frees at once. */
+void te_retire(struct TaudEngine *e, void *p, size_t size);
+/** Free every retired block that no voice (and no retired block still kept)
+ *  holds a pointer into. */
+void te_retire_sweep(TaudEngine *e);
 void te_engine_free(TaudEngine *e);
 double te_random(TaudEngine *e);
 static inline int te_channel_count(const TaudEngine *e) { return e->is64ChannelMode ? MAX_VOICES : NUM_VOICES; }
@@ -1367,6 +1677,7 @@ const TaudCell *te_pattern_read(const TaudEngine *e, int idx);
 const TaudCue *te_cue_at(const TaudEngine *e, int idx);
 void te_upload_sample_inst_blob(TaudEngine *e, const uint8_t *pool, size_t poolLen, const uint8_t *instBin);
 void te_upload_pattern(TaudEngine *e, int slot, const uint8_t *bytes, size_t len);
+void te_clear_pattern(TaudEngine *e, int slot);
 void te_upload_cue(TaudEngine *e, int idx, const uint8_t *bytes, size_t len);
 void te_upload_instrument_patches(TaudEngine *e, int slot, const uint8_t *bytes, size_t len);
 void te_set_cell_format(TaudEngine *e, bool wide);
@@ -1390,6 +1701,7 @@ void te_silence_song_voices(TaudEngine *e, bool ramp);
 void te_reset_sample_fx_state(TaudEngine *e);
 unsigned te_drain_interrupts(TaudEngine *e);
 bool te_render_chunk(TaudEngine *e);
+void te_set_bus_mastering(TaudEngine *e, const TaudMastering *params);
 void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out);
 /** The device's dither over any pair of buffers, its state passed in: the
  *  engine's own, or a fresh one (seed TE_XORSHIFT_SEED, errors zero) for a
@@ -1397,7 +1709,7 @@ void te_pcm32f_to_pcm8(TaudEngine *e, uint8_t *out);
 void te_dither_u8(uint32_t *xs, float err[4], const float *left, const float *right, size_t frames, uint8_t *out);
 /** One step of the dither's xorshift32 stream. */
 uint32_t te_xorshift32(uint32_t *state);
-/** The adapter's xorshift32 seed (AudioAdapter.kt; rng.js makeXorshift32). */
+/** The adapter's xorshift32 seed (AudioAdapter.kt). */
 #define TE_XORSHIFT_SEED 0x9e3779b9u
 
 /* Voice pool + background list. */
@@ -1412,7 +1724,6 @@ extern const int32_t MOD_SIN_TABLE[64];
 extern const int32_t FINETUNE_OFFSET[16];
 extern const double META_MIX_GAIN[256];
 void te_build_tables(TaudEngine *e);
-double te_sinc_tap(const TaudEngine *e, double frac, int tap);
 int te_advance_lfo_phase(int pos, int speed);
 int te_lfo_sample(TaudEngine *e, int pos, int wave);
 int te_lfo_sample_wide(TaudEngine *e, int pos, int wave);
@@ -1442,10 +1753,32 @@ const TaudPatch *te_patch_at(const TaudInst *inst, int patchIndex);
 int te_inst_resolve_meta_layers(const TaudInst *inst, double noteVal, int rowVolume, const TaudMetaLayer **out);
 bool te_patch_is_stereo(const TaudPatch *p);
 bool te_patch_vibrato_inherits(const TaudPatch *p);
+/* The pitch an entry sounds for a trigger at noteVal — NOT confined to the
+ * sixteen octaves of a note value (te_layer_pitch splits it). */
 static inline double te_layer_note(const TaudMetaLayer *l, double noteVal)
 {
-    return l->fixedPitch ? (l->detune & 0xffff) : noteVal + l->detune;
+    return l->fixedPitch ? (l->detune & 0xffff) + l->dDetune : noteVal + l->detune + l->dDetune;
 }
+/* …as the note value its voice holds, and what is left over for
+ * voice.pitchExcess. */
+static inline double te_layer_pitch(const TaudMetaLayer *l, double noteVal, double *excess)
+{
+    double full = te_layer_note(l, noteVal);
+    double held = full < 0x20 ? 0x20 : full > 0xffff ? 0xffff : full;
+    *excess = full - held;
+    return held;
+}
+/* A pitch range's test: from pitchStart through the whole of the last unit
+ * pitchEnd names, each moved by its extension (§9.11, §9.18). */
+static inline bool te_pitch_in_range(double noteVal, int start, double dLo, int end, double dHi)
+{
+    return noteVal >= start + dLo && noteVal < end + 1 + dHi;
+}
+struct TaudPitchExt;
+void te_set_pitch_ext(TaudEngine *e, const uint8_t *section, size_t len);
+void te_apply_pitch_ext(TaudEngine *e, TaudInst *inst);
+void te_pitch_ext_free(TaudEngine *e);
+void te_inst_refresh_lyric(TaudInst *inst);
 void te_inst_toggle_invert_bit(TaudInst *inst, int loopOffset, int loopLen);
 bool te_inst_invert_bit(TaudInst *inst, int loopOffset, int loopLen);
 bool te_inst_set_mod_region(TaudInst *inst, double from, double to);
@@ -1483,6 +1816,10 @@ static inline bool te_inst_mod_bit(const TaudInst *inst, int i)
 #define REGION_SET 1
 #define REGION_COMB 2
 extern const int MOD_STEP[16];
+extern const int MOD_JUMP_SLICES[2];
+extern const double MOD_SCATTER_FRAC[3];
+extern const int EXT_JUMP_N[16];
+extern const double EXT_SCATTER_FRAC[16];
 
 enum {
     EXT_KIND_NOOP, EXT_KIND_INVERT, EXT_KIND_FUNK, EXT_KIND_XOR, EXT_KIND_MIRROR,
@@ -1516,6 +1853,10 @@ static inline bool te_is_rnd_op(int op) { return op >= MOD_RND512 && op <= MOD_R
 /* sampler.c */
 double te_compute_playback_rate(const TaudEngine *e, const TaudVoice *v, double noteVal, double tuningRatio);
 double te_fetch_tracker_sample(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double posOffset);
+double te_fetch_tracker_sample_sub(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double posOffset,
+                                   int n, bool last);
+double te_bessel_i0(double x);
+double te_fm_decimate(const TaudEngine *e, double *state, double x);
 void te_fetch_tracker_sample_stereo(TaudEngine *e, TaudVoice *v, TaudInst *inst, int interpMode, double out[2]);
 void te_start_ramp_out(TaudEngine *e, TaudVoice *v);
 void te_start_cut_ramp(TaudEngine *e, TaudVoice *v);
@@ -1559,6 +1900,9 @@ void te_fm_set_operator_vibrato(TaudFmRig *rig, int p, int s, int d);
 /* opl.c */
 extern const int32_t OPL_MULTIPLE_X2[16];
 extern const int32_t OPL_SUSTAIN_LEVEL[16];
+/* The chip's two ROMs: the log-sine quarter wave and the exponent. */
+extern const uint16_t OPL_LOG_SIN[256];
+extern const uint16_t OPL_EXP[256];
 #define OPL_VIBRATO_PERIOD 8192
 #define OPL_TREMOLO_PERIOD 13440
 void te_decode_opl_patch(const uint8_t *bytes, TaudOplPatch *into);
@@ -1576,12 +1920,19 @@ void te_opl_key_scaling(double hz, int ksr, int ksl, int32_t out[2]);
 int64_t te_opl_chip_index(const TaudEngine *e, int64_t frame, double *frac);
 double te_opl_tremolo_at(int deep, int p);
 double te_opl_vibrato_at(int deep, int p);
+/* The block and F-number a driver would write for `hz` (block << 10 | fnum),
+ * and the channel's next chip sample at chip clock k. */
+int te_opl_block_fnum(double hz, bool lowFnum);
+int te_opl_chip_step(TaudOplState *st, int64_t k);
 
 /* psg.c */
 void te_psg_tables_init(TaudEngine *e);
 void te_decode_psg_patch(const uint8_t *bytes, TaudPsgPatch *into);
 void te_psg_clear_runtime(TaudPsgPatch *patch);
 bool te_psg_write_register(TaudPsgPatch *patch, int reg);
+/* An oscillator's level and mute, the run-time overlay over the record's. */
+int te_psg_level(const TaudPsgPatch *patch, int i);
+bool te_psg_muted(const TaudPsgPatch *patch, int i);
 void te_psg_state_init(TaudPsgState *st);
 void te_psg_key_on(TaudPsgState *st, TaudPsgPatch *patch, bool carry);
 void te_psg_key_off(TaudPsgState *st);
@@ -1599,6 +1950,8 @@ double te_render_psg_voice(TaudEngine *e, TaudVoice *v, int64_t frame);
 #define PHASE_CODA 2
 #define PHASE_DONE 3
 void te_formant_tables_init(TaudFormantTables *t, int rate);
+/* The equal-loudness weighting in dB at f, searching up from index *j. */
+double te_elw_db(const TaudFormantTables *T, double f, int *j);
 void te_decode_formant_block(const uint8_t *raw, TaudFormantPatch *patch);
 void te_formant_state_init(TaudFormantState *st);
 void te_formant_note_on(TaudEngine *e, TaudFormantState *st, const TaudFormantPatch *patch, bool keep);
@@ -1621,6 +1974,8 @@ double te_fold_azimuth_to_pan(double az);
 void te_direction_from_angles(double az, double el, double out[3]);
 void te_angles_from_direction(double x, double y, double z, double out[2]);
 void te_sample_channel_angles(double az, double el, double localAz, double out[2]);
+/* Where channel k of a `chans`-channel sample sits round its source (azimuth units). */
+double te_sample_channel_layout(int chans, int k);
 void te_angles_from_spatial_arg(int arg, double out[2]);
 void te_step_toward_target(double az, double el, double tgtAz, double tgtEl, double stepUnits, double out[2]);
 void te_encode_sn3d(double az, double el, int order, double *out);
@@ -1635,6 +1990,29 @@ double te_voice_azimuth(const TaudVoice *v);
 double te_voice_pan_byte(const TaudVoice *v);
 double te_voice_elevation(const TaudVoice *v);
 double te_display_pan_byte(TaudEngine *e, int vi, const TaudVoice *v);
+void te_display_angles(TaudEngine *e, int vi, const TaudVoice *v, double out[2]);
+/** Install the analysis bus: layout −1 = none, 0 = the scope harmonics alone,
+ *  1 quad, 2 5.1, 3 7.1 (speakers.js). */
+void te_set_analysis_bus(TaudEngine *e, int layout);
+TaudSpatialBus *te_analysis_bus_new(int layout);
+void te_bus_channel_gains(const TaudSpatialBus *bus, double az, double el, double *out, int off);
+/** Make `bus` a render target of `kind`: an ambisonic one of `order` (planar
+ *  or full sphere), or speaker layout 1 quad / 2 5.1 / 3 7.1. Sets its
+ *  channel count; false for a kind or a layout it does not know. */
+bool te_spatial_bus_configure(TaudSpatialBus *bus, int kind, int order, bool planar, int layout);
+/** Install (kind ≥ 0) or remove (−1) an exporter's render target. */
+void te_set_spatial_renderer(TaudEngine *e, int kind, int order, bool planar, int layout);
+const double *te_analysis_voice_gains(TaudEngine *e, TaudVoice *v);
+
+/* snapshot.c — what the page draws from */
+void te_fill_snapshot(TaudEngine *e, float *f);
+int te_get_invert_mask(const TaudEngine *e, int slot, uint8_t *out, int cap);
+int te_get_mod_mask(const TaudEngine *e, int slot, uint8_t *out, int cap);
+void te_get_sample_mod(const TaudEngine *e, int slot, double *out);
+int te_get_psg_state(const TaudEngine *e, int slot, int *out);
+int te_get_formant_state(const TaudEngine *e, int slot, double *voices, int *extra, int *lyric, int lyricCap,
+                         int *counts);
+void te_get_active_note_counts(const TaudEngine *e, int32_t *out);
 const double *te_spatial_voice_gains(TaudEngine *e, TaudVoice *v);
 void te_spatial_bus_add_source(TaudSpatialBus *bus, int n, double value, const double *gains, int off, double ramp);
 void te_spatial_bus_stereo_at(TaudSpatialBus *bus, int n, double out[2]);
@@ -1655,7 +2033,7 @@ void te_cap_background_voices(TaudEngine *e);
 void te_cut_layer_children(TaudEngine *e, int vi);
 /* glide: a G/L on a silent lane, triggering as its note's glide (lyrics). */
 void te_trigger_meta_or_note(TaudEngine *e, TaudVoice *v, int vi, double noteVal, int instId, int rowVolOverride,
-                             bool glide);
+                             bool lyricReset, bool glide);
 void te_trigger_note(TaudEngine *e, TaudVoice *v, double noteVal, int instId, int volOverride,
                      const TaudFormantPatch *lyricPatch);
 int te_narrow_vol_axis(const TaudEngine *e, int v);
@@ -1669,6 +2047,13 @@ void te_apply_pan_column_wide(TaudEngine *e, TaudVoice *v, const TaudCell *row);
 
 /* effects.c */
 void te_apply_effect_row(TaudEngine *e, TaudVoice *v, int vi, int op, int rawArg, int ext, bool hasExt);
+void te_apply_filter_param_effect(TaudEngine *e, TaudVoice *voice, int vi, int rawArg, bool isResonance);
+void te_resolve_active_envelopes(TaudVoice *v, const TaudInst *inst, const TaudPatch *patch);
+TaudVoice *te_ghost_voice(TaudEngine *e, const TaudVoice *src, int channel);
+double te_advance_pf_role(const TaudEnvPoint *env, int loopWord, int susWord, bool keyOff,
+                          double tickSec, int *idxBox, double *timeBox);
+double te_read_sample_point(TaudEngine *e, TaudVoice *v, TaudInst *inst, int idx,
+                            int sampleLen, int binMax, uint32_t basePtr);
 int te_apply_retrig_vol_mod(int vol, int x, int step, int max);
 
 /* row.c */
@@ -1676,6 +2061,21 @@ void te_apply_tracker_row(TaudEngine *e);
 void te_advance_row(TaudEngine *e);
 void te_advance_row_position(TaudEngine *e);
 void te_reconstruct_ditto_state(TaudEngine *e, int startRow);
+
+/* host.c — what a host that edits asks for and a player never does */
+void te_jam_note(TaudEngine *e, int vi, int note, int instId, bool audition);
+void te_jam_sample(TaudEngine *e, int vi, int note, uint32_t ptr, int len, int rate, int playStart,
+                   int loopStart, int loopEnd, int loopMode, int detune, uint32_t chanPtr2, int chanMode);
+void te_jam_stop(TaudEngine *e);
+void te_jam_stop_voice(TaudEngine *e, int vi);
+void te_jam_key_off(TaudEngine *e, int vi);
+void te_jam_release(TaudEngine *e, int vi);
+void te_set_voice_fader(TaudEngine *e, int vi, int fader);
+int te_get_voice_fader(const TaudEngine *e, int vi);
+void te_reset_params(TaudEngine *e);
+bool te_chase_tracker_row(TaudEngine *e, int cue, int row);
+int te_cue_row_limit(const TaudCue *c);
+void te_reset_pattern_loop_state(TaudEngine *e);
 
 /* tick.c */
 void te_apply_tracker_tick(TaudEngine *e);
@@ -1730,11 +2130,16 @@ typedef struct {
     int numImix;
     TaudImixBlock *imix;        /* the IMix section's valid blocks, owned */
     int numLyrics;
+    /* The `IPit` payload, inside projData (§9.18); pitchExtLen 0 = none. */
+    size_t pitchExtOff, pitchExtLen;
     TaudLyricEntry *lyrics;     /* the ILyr section's valid entries, owned */
 } TaudDoc;
 
 TaudError te_parse_taud(const uint8_t *file, size_t len, TaudDoc *doc);
 void te_doc_free(TaudDoc *doc);
+/** The `ILyr` section's entries (§9.17): the count kept, or -1 out of memory. */
+int te_parse_lyrics(const uint8_t *pl, size_t len, TaudLyricEntry **out);
+void te_lyrics_free(TaudLyricEntry *list, int count);
 void te_load_into_engine(TaudEngine *e, const TaudDoc *doc, int songIndex);
 
 /* Decompressors: return a malloc'd buffer (at least `expected` bytes, zero
